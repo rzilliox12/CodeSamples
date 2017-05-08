@@ -1,0 +1,72 @@
+//Sample6
+
+////////////////
+//advancedtoolbar_toolbar5.js
+
+/* 
+ * PURPOSE: Custom scripting for the tissue QC advanced toolbar
+ * USED IN: clmDataEntryGridTissueQC
+ */
+function updateProperties() {
+    var columns = 14;
+    var attributes = rightframe.document.getElementById("__attributes").value;
+
+    var requestItemIds = attributes.split("|")[1].replaceAll("','", ";");
+    var requestItemIdsList = requestItemIds.split(";");
+
+    var omniDxIndex = 7;
+    var passFailIndex = 9;
+    var pathDecisionIndex = 10;
+
+    var omniDxValues = [];
+    var passFailValues = [];
+    var pathDecisionValues = [];
+
+    for (var i = 0; i < requestItemIdsList.length; i++) {
+        mapRequestItemIdsToValueIfEdited(omniDxIndex, requestItemIdsList[i], omniDxValues);
+        mapRequestItemIdsToValueIfEdited(passFailIndex, requestItemIdsList[i], passFailValues);
+        mapRequestItemIdsToValueIfEdited(pathDecisionIndex, requestItemIdsList[i], pathDecisionValues);
+
+        omniDxIndex += columns;
+        passFailIndex += columns;
+        pathDecisionIndex += columns;
+    }
+
+    if (!isEmptyObject(omniDxValues) || !isEmptyObject(passFailValues) || !isEmptyObject(pathDecisionValues)) {
+        sapphire.ajax.callClass("ajax.UpdateRequestItem",
+            "updateRequestItemCallback",
+            {
+                omnidxvalues: omniDxValues,
+                passfailvalues: passFailValues,
+                pathdecisionvalues: pathDecisionValues
+            },
+            false, false);
+    }
+    else {
+        save();
+    }
+}
+
+function mapRequestItemIdsToValueIfEdited(columnIndex, requestItemId, entryArray) {
+    var element = rightframe.document.getElementById("di" + columnIndex + "_enteredtext");
+    var elementEdited = rightframe.document.getElementById("__di" + columnIndex).value;
+
+    if(element && elementEdited == "D") {
+        entryArray[requestItemId] = element.value;
+    }
+}
+
+function updateRequestItemCallback() {
+    save();
+}
+
+function isEmptyObject(obj) {
+    var name;
+    for (name in obj) {
+        if (obj.hasOwnProperty(name)) {
+            return false;
+        }
+    }
+    return true;
+}
+

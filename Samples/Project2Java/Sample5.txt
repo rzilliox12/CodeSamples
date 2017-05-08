@@ -1,0 +1,1640 @@
+//Sample5
+
+//////////////////////////////////////
+//CDataWarehouseResource
+
+package service;
+
+import org.apache.commons.configuration.ConfigurationException;
+import sapphire.SapphireException;
+
+import javax.ws.rs.*;
+import javax.ws.rs.core.Response;
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.net.MalformedURLException;
+import java.sql.SQLException;
+
+@Path("/datawarehouse")
+public interface CDataWarehouseResource {
+    @POST
+    @Path("/create-order")
+    @Produces("text/plain")
+    Response processOrderRequest(@QueryParam("order_id") String order_id,
+                                 @QueryParam("panel_name") String panel_name)
+            throws ConfigurationException, MalformedURLException, UnsupportedEncodingException;
+
+    @POST
+    @Path("/send-orderids")
+    @Produces("application/json")
+    Response processOrder(final String incomingMessage) throws IOException, ConfigurationException;
+
+    @POST
+    @Path("/cancel-order")
+    @Produces("text/plain")
+    Response processOrderCancelRequest(@QueryParam("order_id") String order_id)
+            throws ConfigurationException;
+
+    @POST
+    @Path("/order-status-update-from-lis-to-clims")
+    @Produces("text/plain")
+    Response processOrderStatusUpdateFromLis(@FormParam("orderId") String orderId,
+                                             @FormParam("orderStatus") String orderStatus);
+
+    @POST
+    @Path("/confirmation-from-lis-to-clims")
+    @Produces("application/json")
+    Response processConfirmationFromLis(final String incomingConfirmationMessage)
+            throws SapphireException, ConfigurationException, SQLException, IOException;
+
+    @POST
+    @Path("/confirm-ocp-order")
+    @Produces("text/plain")
+    Response processConfirmOCPOrderFromClims(@QueryParam("confirmationId") String confirmationId,
+                                             @QueryParam("batchId") String batchId,
+                                             @QueryParam("variantType") String variantType,
+                                             @QueryParam("fusionObservation") String fusionObservation,
+                                             @QueryParam("confirmationCall") String confirmationCall,
+                                             @QueryParam("filter") String filter)
+            throws UnsupportedEncodingException;
+
+    @POST
+    @Path("/send-run-message")
+    @Produces("text/plain")
+    Response processSendRunMessage(@QueryParam("runId") String runId,
+                                   @QueryParam("instrumentRunId") String instrumentRunId,
+                                   @QueryParam("panelConfiguration") String panelConfiguration,
+                                   @QueryParam("batchId") String batchId)
+            throws ConfigurationException, UnsupportedEncodingException;
+
+    @POST
+    @Path("/send-irc-run-message")
+    @Produces("text/plain")
+    Response processSendIRCRunMessage(@QueryParam("runId") String runId,
+                                   @QueryParam("instrumentRunId") String instrumentRunId,
+                                   @QueryParam("panelConfiguration") String panelConfiguration,
+                                   @QueryParam("batchId") String batchId)
+            throws ConfigurationException, UnsupportedEncodingException;
+
+    @POST
+    @Path("/send-cancel-message")
+    @Produces("text/plain")
+    Response processSendCancelMessageFromClims(@QueryParam("orderId") String confirmationId,
+                                               @QueryParam("sampleId") String batchId,
+                                               @QueryParam("ccpOcpTumorNuclei") String variantType,
+                                               @QueryParam("cancelReason") String fusionObservation)
+            throws UnsupportedEncodingException;
+}
+
+
+//////////////////////////
+//CDataWarehouseService.java
+
+package service;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import client.CToDataWarehouseClient;
+import client.DataWarehouseToCClient;
+import messages.lis.OrderGenerator;
+import messages.lis.OrderHelper;
+import messages.lis.OrderStatusChanger;
+import messages.lis.RunMessageGenerator;
+import messages.lis.model.*;
+import util.MessageUtil;
+import org.apache.commons.configuration.ConfigurationException;
+import org.apache.commons.lang.StringUtils;
+import org.apache.log4j.Logger;
+import sapphire.SapphireException;
+
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.net.URLDecoder;
+import java.sql.SQLException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+
+/**
+ * Class to implement Data Warehouse related web resources.
+ */
+public class CDataWarehouseService implements CDataWarehouseResource {
+
+    
+    private Logger logger = Logger.getLogger(CDataWarehouseService.class);
+    private CToDataWarehouseClient cToDataWarehouseClient;
+    private DataWarehouseToCClient dataWarehouseToCClient;
+
+    MessageUtil messageUtil = new MessageUtil();
+
+    public CDataWarehouseService() throws ConfigurationException {
+        cToDataWarehouseClient = new CToDataWarehouseClient();
+        dataWarehouseToCClient = new DataWarehouseToCClient();
+    }
+
+    public Response processOrderRequest(String orderId, String panelName) throws ConfigurationException {
+        String sessionToken = climsToDataWarehouseClient.getDataWarehouseSessionToken();
+        if (sessionToken == null) {
+            Response.ResponseBuilder builder = Response.status(500);
+            builder.entity("FAILURE: Unable to generate session token for Data Warehouse.");
+            return builder.build();
+        }
+
+        String orderType = "Custom Immune Response Assay".equals(panelName) ? "CIRA" : "newOrder";
+
+        return createLisOrder(orderId, sessionToken, orderType);
+
+    }
+
+    private Response createLisOrder(String orderId, String sessionToken, String orderType) throws ConfigurationException {
+        OrderGenerator orderGenerator = new OrderGenerator();
+        Order newOrder = orderGenerator.createLisOrder(orderId, orderType);
+
+        Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+        String orderJson = gson.toJson(newOrder);
+
+        return getResponseFromOrder(sessionToken, orderJson);
+    }
+
+    private Response getResponseFromOrder(String sessionToken, String orderJson) throws ConfigurationException {
+        String dwResponse = climsToDataWarehouseClient.createOrder(sessionToken, orderJson);
+
+        try {
+            JsonParser jsonParser = new JsonParser();
+            JsonObject json = (JsonObject) jsonParser.parse(dwResponse);
+            String responseCode = (json.get("http_status_code") != null) ? json.get("http_status_code").getAsString() : "201";
+            String callStatus = "201".equals(responseCode) ? "Success" : "Failure";
+            messageUtil.logMessage("CLIMS Web", "Data Warehouse", "Refer Payload", "create-order", callStatus, "N/A", orderJson, responseCode, dwResponse);
+        } catch (Exception e) {
+            logger.error("Failed to create web service log entry.  Failure to obtain CLIMS configuration file.  Payload returned: " + dwResponse, e);
+        }
+
+        Response.ResponseBuilder builder = Response.ok(dwResponse);
+        return builder.build();
+    }
+
+    @Override
+    public Response processOrder(String incomingMessage) throws IOException, ConfigurationException {
+        String sessionToken = climsToDataWarehouseClient.getDataWarehouseSessionToken();
+        if (sessionToken == null) {
+            Response.ResponseBuilder builder = Response.status(500);
+            builder.entity("FAILURE: Unable to generate session token for Data Warehouse.");
+            return builder.build();
+        }
+
+        ObjectMapper objectMapper = new ObjectMapper();
+        List<String> orderIds = objectMapper.readValue(incomingMessage, List.class);
+
+        return createLisOrders(orderIds, sessionToken, "newOrder");
+    }
+
+    private Response createLisOrders(List<String> orderIds, String sessionToken, String orderType) throws ConfigurationException {
+        OrderGenerator orderGenerator = new OrderGenerator();
+        List<Order> orders = new ArrayList<>();
+        for (String orderId : orderIds) {
+            Order newOrder = orderGenerator.createLisOrder(orderId, orderType);
+            orders.add(newOrder);
+        }
+        Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+        String orderJson = gson.toJson(orders);
+
+        return getResponseFromOrder(sessionToken, orderJson);
+    }
+
+    public Response processOrderCancelRequest(String orderId) throws ConfigurationException {
+        String sessionToken = climsToDataWarehouseClient.getDataWarehouseSessionToken();
+        if (sessionToken == null) {
+            Response.ResponseBuilder builder = Response.status(500);
+            builder.entity("FAILURE: Unable to generate session token for Data Warehouse.");
+            return builder.build();
+        }
+
+        return createLisOrder(orderId, sessionToken, "cancelOrder");
+    }
+
+    @Override
+    public Response processOrderStatusUpdateFromLis(String orderId, String orderStatus) {
+        if (orderId == null || "".equals(orderId) || orderStatus == null || "".equals(orderStatus)) {
+            logger.info("orderId and orderStatus cannot be null or empty");
+            logger.info("orderId: " + orderId + " with orderStatus: " + orderStatus);
+
+            try {
+                messageUtil.logMessage("Data Warehouse", "CLIMS Web", "Refer Payload", "order-status-update-from-lis-to-clims",
+                        "Failure", "orderId: " + orderId + "&orderStatus: " + orderStatus,
+                        "orderId: " + orderId + "&orderStatus: " + orderStatus, "Error", "null");
+            } catch (Exception e) {
+                logger.info("Error logging message, Exception: " + e);
+            }
+
+            return null;
+        } else {
+            logger.info("orderId: " + orderId + " with orderStatus: " + orderStatus);
+            OrderStatusChanger orderStatusChanger = new OrderStatusChanger();
+            orderStatusChanger.connectToClimsToUpdateOrderStatus(orderId, orderStatus);
+
+            Response.ResponseBuilder builder = Response.ok();
+            Response response = builder.build();
+
+            String responseAsString = response.toString();
+            try {
+                messageUtil.logMessage("Data Warehouse", "CLIMS Web", "Refer Payload", "order-status-update-from-lis-to-clims",
+                        "Success", "orderId: " + orderId + "&orderStatus: " + orderStatus,
+                        "orderId: " + orderId + "&orderStatus: " + orderStatus, "Ok", responseAsString);
+            } catch (Exception e) {
+                logger.info("Error logging message, Exception: " + e);
+            }
+
+            return response;
+        }
+    }
+
+    @Override
+    public Response processConfirmationFromLis(String incomingConfirmationMessage)
+            throws SapphireException, ConfigurationException, SQLException, IOException {
+        Response.ResponseBuilder builder;
+        Response response;
+        String responseAsString;
+        String timeStamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
+
+        if (StringUtils.isEmpty(incomingConfirmationMessage)) {
+            logger.info("incomingConfirmationMessage cannot be null or empty");
+
+            builder = Response.status(500).entity("{\"ResponseStatus\":\"Failure\"}").type(MediaType.APPLICATION_JSON);
+            response = builder.build();
+
+            responseAsString = response.toString();
+
+            try {
+                messageUtil.logMessage("Data Warehouse", "CLIMS Web", timeStamp, "confirmation-from-lis-to-clims",
+                        "Failure", "JSON String", incomingConfirmationMessage, "Error", responseAsString);
+            } catch (Exception e) {
+                logger.info("Error logging message, Exception: " + e);
+            }
+        } else {
+            List<Confirmation> confirmations = parseIncomingConfirmationMessage(incomingConfirmationMessage);
+            dataWarehouseToClimsClient.handleConfirmations(confirmations);
+
+            builder = Response.ok("{\"ResponseStatus\":\"Success\"}", MediaType.APPLICATION_JSON);
+            response = builder.build();
+
+            responseAsString = response.toString();
+            try {
+                messageUtil.logMessage("Data Warehouse", "CLIMS Web", timeStamp, "confirmation-from-lis-to-clims",
+                        "Success", "JSON String", incomingConfirmationMessage, "Ok", responseAsString);
+            } catch (Exception e) {
+                logger.info("Error logging message, Exception: " + e);
+            }
+        }
+
+        return response;
+    }
+
+    private List<Confirmation> parseIncomingConfirmationMessage(String incomingConfirmationMessage) throws IOException {
+        ObjectMapper objectMapper = new ObjectMapper().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+        return objectMapper.readValue(incomingConfirmationMessage, new TypeReference<List<Confirmation>>() {
+        });
+    }
+
+    @Override
+    public Response processConfirmOCPOrderFromClims(String confirmationId, String batchId, String variantType,
+                                                    String fusionObservation, String confirmationCall, String filter)
+            throws UnsupportedEncodingException {
+        String sessionToken = climsToDataWarehouseClient.getDataWarehouseSessionToken();
+        if (sessionToken == null) {
+            Response.ResponseBuilder builder = Response.status(500);
+            builder.entity("FAILURE: Unable to generate session token for Data Warehouse.");
+            return builder.build();
+        }
+
+        String confirmationResultJson = createConfirmationResultJson(confirmationId, batchId, variantType,
+                fusionObservation, confirmationCall, filter);
+
+        Response response;
+        Response.ResponseBuilder builder;
+        try {
+            String dataWarehouseResponse = climsToDataWarehouseClient.sendConfirmationResult(sessionToken, confirmationResultJson);
+
+            builder = Response.ok(dataWarehouseResponse);
+            response = builder.build();
+
+            String responseAsString = response.toString();
+            try {
+                messageUtil.logMessage("CLIMS Web", "Data Warehouse", "Refer Payload", "Send-Confirmation-Message-To-LIS",
+                        "Success", "JSON String", confirmationResultJson, "Ok", responseAsString);
+            } catch (Exception e) {
+                logger.info("Error logging message, Exception: " + e);
+            }
+
+        } catch (Exception e) {
+            builder = Response.serverError();
+            response = builder.build();
+
+            String responseAsString = response.toString();
+            try {
+                messageUtil.logMessage("CLIMS Web", "Data Warehouse", "Refer Payload", "Send-Confirmation-Message-To-LIS",
+                        "Error", "JSON String", confirmationResultJson, "Ok", responseAsString);
+            } catch (Exception ex) {
+                logger.info("Error logging message, Exception: " + ex);
+            }
+        }
+        return response;
+    }
+
+    private String createConfirmationResultJson(String confirmationId, String batchId, String variantType,
+                                                String fusionObservation, String confirmationCall, String filter)
+            throws UnsupportedEncodingException {
+        ConfirmationResult confirmationResult = new ConfirmationResult();
+        confirmationResult.setConfirmationId(Long.parseLong(confirmationId));
+        confirmationResult.setVariantType(variantType);
+        String climsDataDirectory = OrderHelper.getClimsDataDirectoryForVariantConfirmation(batchId);
+        if (StringUtils.isNotEmpty(climsDataDirectory)) {
+            confirmationResult.setDataDirectory(climsDataDirectory);
+        }
+        if (StringUtils.isNotEmpty(fusionObservation)) {
+            fusionObservation = URLDecoder.decode(fusionObservation, "UTF-8");
+            confirmationResult.setObservationFusion(fusionObservation);
+        }
+        if (StringUtils.isNotEmpty(confirmationCall)) {
+            confirmationCall = URLDecoder.decode(confirmationCall, "UTF-8");
+            confirmationResult.setCall(confirmationCall);
+        }
+        if (StringUtils.isNotEmpty(filter)) {
+            filter = URLDecoder.decode(filter, "UTF-8");
+            confirmationResult.setFilter(filter);
+        }
+
+        Gson gson = new Gson();
+        return gson.toJson(confirmationResult);
+    }
+
+    @Override
+    public Response processSendRunMessage(String runId, String instrumentRunId, String panelConfiguration, String batchId)
+            throws ConfigurationException, UnsupportedEncodingException {
+        String sessionToken = climsToDataWarehouseClient.getDataWarehouseSessionToken();
+        if (sessionToken == null) {
+            Response.ResponseBuilder builder = Response.status(500);
+            builder.entity("FAILURE: Unable to generate session token for Data Warehouse.");
+            return builder.build();
+        }
+
+        RunMessageGenerator runMessageGenerator = new RunMessageGenerator();
+        panelConfiguration = URLDecoder.decode(panelConfiguration, "UTF-8");
+        RunMessage runMessage = runMessageGenerator.createRunMessage(runId, instrumentRunId, panelConfiguration, batchId);
+        Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+        String runMessageJson = gson.toJson(runMessage);
+
+        String dwResponse = climsToDataWarehouseClient.sendRunMessage(sessionToken, runMessageJson);
+
+        try {
+            JsonParser jsonParser = new JsonParser();
+            JsonObject json = (JsonObject) jsonParser.parse(dwResponse);
+            String responseCode = (json.get("http_status_code") != null) ? json.get("http_status_code").getAsString() : "201";
+            String callStatus = "201".equals(responseCode) ? "Success" : "Failure";
+            messageUtil.logMessage("CLIMS Web", "Data Warehouse", "Refer Payload", "send-ocp-run-message", callStatus, "N/A", runMessageJson, responseCode, dwResponse);
+        } catch (Exception e) {
+            logger.error("Failed to create web service log entry.  Failure to obtain CLIMS configuration file.  Payload returned: " + dwResponse, e);
+        }
+
+        Response.ResponseBuilder builder = Response.ok(dwResponse);
+        return builder.build();
+    }
+
+    @Override
+    public Response processSendIRCRunMessage(String runId, String instrumentRunId, String panelConfiguration, String batchId)
+            throws ConfigurationException, UnsupportedEncodingException {
+        String sessionToken = climsToDataWarehouseClient.getDataWarehouseSessionToken();
+        if (sessionToken == null) {
+            Response.ResponseBuilder builder = Response.status(500);
+            builder.entity("FAILURE: Unable to generate session token for Data Warehouse.");
+            return builder.build();
+        }
+
+        RunMessageGenerator runMessageGenerator = new RunMessageGenerator();
+        panelConfiguration = URLDecoder.decode(panelConfiguration, "UTF-8");
+        RunMessage runMessage = runMessageGenerator.createRunMessage(runId, instrumentRunId, panelConfiguration, batchId);
+        Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+        String runMessageJson = gson.toJson(runMessage);
+
+        String dwResponse = climsToDataWarehouseClient.sendRunMessage(sessionToken, runMessageJson);
+
+        try {
+            JsonParser jsonParser = new JsonParser();
+            JsonObject json = (JsonObject) jsonParser.parse(dwResponse);
+            String responseCode = (json.get("http_status_code") != null) ? json.get("http_status_code").getAsString() : "201";
+            String callStatus = "201".equals(responseCode) ? "Success" : "Failure";
+            messageUtil.logMessage("CLIMS Web", "Data Warehouse", "Refer Payload", "send-irc-run-message", callStatus, "N/A", runMessageJson, responseCode, dwResponse);
+        } catch (Exception e) {
+            logger.error("Failed to create web service log entry.  Failure to obtain CLIMS configuration file.  Payload returned: " + dwResponse, e);
+        }
+
+        Response.ResponseBuilder builder = Response.ok(dwResponse);
+        return builder.build();
+    }
+
+    @Override
+    public Response processSendCancelMessageFromClims(String orderId, String sampleId, String ccpOcpTumorNuclei, String cancelReason) throws UnsupportedEncodingException {
+        String sessionToken = climsToDataWarehouseClient.getDataWarehouseSessionToken();
+        if (sessionToken == null) {
+            Response.ResponseBuilder builder = Response.status(500);
+            builder.entity("FAILURE: Unable to generate session token for Data Warehouse.");
+            return builder.build();
+        }
+
+        CancelMessage cancelMessage = new CancelMessage(orderId, sampleId, ccpOcpTumorNuclei, cancelReason);
+        Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+        String cancelMessageJson = gson.toJson(cancelMessage);
+
+        String dwResponse = climsToDataWarehouseClient.sendCancelMessage(sessionToken, cancelMessageJson);
+
+        try {
+            JsonParser jsonParser = new JsonParser();
+            JsonObject json = (JsonObject) jsonParser.parse(dwResponse);
+            String responseCode = (json.get("http_status_code") != null) ? json.get("http_status_code").getAsString() : "201";
+            String callStatus = "201".equals(responseCode) ? "Success" : "Failure";
+            messageUtil.logMessage("CLIMS Web", "Data Warehouse", "Refer Payload", "send-cancel-message", callStatus, "N/A", cancelMessageJson, responseCode, dwResponse);
+        } catch (Exception e) {
+            logger.error("Failed to create web service log entry.  Failure to obtain CLIMS configuration file.  Payload returned: " + dwResponse, e);
+        }
+
+        Response.ResponseBuilder builder = Response.ok();
+        return builder.build();
+    }
+}
+
+
+////////////////////////////
+//OrderGenerator.java
+
+package com.omniseq.climsweb.messages.lis;
+
+import messages.lis.model.Order;
+import util.JdbcUtil;
+import org.apache.commons.configuration.ConfigurationException;
+import org.apache.log4j.Logger;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+
+public class OrderGenerator {
+
+    Logger logger = Logger.getLogger(OrderGenerator.class);
+
+    public Order createLisOrder(String orderId, String orderType) throws ConfigurationException {
+
+        try {
+            Order order = new Order();
+            ClimsInfoSqlGenerator climsInfoSqlGenerator = new ClimsInfoSqlGenerator();
+            Connection dbConnection = JdbcUtil.getClimsDevConnection();
+
+            String orderInfoSql = climsInfoSqlGenerator.getOrderInfoSqlStatement();
+            PreparedStatement orderInfoPreparedStatement = dbConnection.prepareStatement(orderInfoSql, ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+            orderInfoPreparedStatement.setString(1, orderId);
+            ResultSet orderInfoResultSet = orderInfoPreparedStatement.executeQuery();
+
+            String insuranceInfoSql = climsInfoSqlGenerator.getInsuranceInfoSqlStatement();
+            PreparedStatement insuranceInfoPreparedStatement = dbConnection.prepareStatement(insuranceInfoSql, ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+            insuranceInfoPreparedStatement.setString(1, orderId);
+            ResultSet insuranceInfoResultSet = insuranceInfoPreparedStatement.executeQuery();
+
+            String specimenInfoSql = climsInfoSqlGenerator.getSpecimenInfoSqlStatement();
+            PreparedStatement specimenInfoPreparedStatement = dbConnection.prepareStatement(specimenInfoSql, ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+            specimenInfoPreparedStatement.setString(1, orderId);
+            specimenInfoPreparedStatement.setString(2, orderId);
+            specimenInfoPreparedStatement.setString(3, orderId);
+            specimenInfoPreparedStatement.setString(4, orderId);
+            specimenInfoPreparedStatement.setString(5, orderId);
+            ResultSet specimenInfoResultSet = specimenInfoPreparedStatement.executeQuery();
+
+            String minimumOrderSampleReceiveDateSql = climsInfoSqlGenerator.getMinimumOrderSampleReceiveDateSqlStatement();
+            PreparedStatement minimumOrderSampleReceiveDatePreparedStatement = dbConnection.prepareStatement(minimumOrderSampleReceiveDateSql, ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+            minimumOrderSampleReceiveDatePreparedStatement.setString(1, orderId);
+            ResultSet minimumOrderSampleReceiveDateResultSet = minimumOrderSampleReceiveDatePreparedStatement.executeQuery();
+
+            String panelInfoSql = climsInfoSqlGenerator.getPanelInfoSqlStatement();
+            PreparedStatement panelInfoPreparedStatement = dbConnection.prepareStatement(panelInfoSql, ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+            panelInfoPreparedStatement.setString(1, orderId);
+            ResultSet panelInfoResultSet = panelInfoPreparedStatement.executeQuery();
+
+            String singleTestInfoSql = climsInfoSqlGenerator.getSingleTestInfoSqlStatement();
+            PreparedStatement singleTestInfoPreparedStatement = dbConnection.prepareStatement(singleTestInfoSql, ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+            singleTestInfoPreparedStatement.setString(1, orderId);
+            ResultSet singleTestInfoResultSet = singleTestInfoPreparedStatement.executeQuery();
+
+            String aggregatePathologySql = climsInfoSqlGenerator.getAggregatePathologySqlStatement();
+            PreparedStatement aggregatePathologyPreparedStatement = dbConnection.prepareStatement(aggregatePathologySql, ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+            aggregatePathologyPreparedStatement.setString(1, orderId);
+            aggregatePathologyPreparedStatement.setString(2, orderId);
+            ResultSet aggregatePathologyResultSet = aggregatePathologyPreparedStatement.executeQuery();
+
+            String ciraOrderInfoSql = climsInfoSqlGenerator.getCiraOrderInfoSqlStatement();
+            PreparedStatement ciraOrderInfoPreparedStatement = dbConnection.prepareStatement(ciraOrderInfoSql, ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+            ciraOrderInfoPreparedStatement.setString(1,orderId);
+            ResultSet ciraOrderInfoResultSet = ciraOrderInfoPreparedStatement.executeQuery();
+            ciraOrderInfoResultSet.beforeFirst();
+
+            orderInfoResultSet.beforeFirst();
+
+            OrderCreationDataSetter orderCreationDataSetter = new OrderCreationDataSetter();
+
+            if ("newOrder".equals(orderType)) {
+                orderCreationDataSetter.populateNewOrder(order, orderInfoResultSet, insuranceInfoResultSet,
+                        specimenInfoResultSet, minimumOrderSampleReceiveDateResultSet, panelInfoResultSet,
+                        singleTestInfoResultSet, aggregatePathologyResultSet);
+            } else if ("cancelOrder".equals(orderType)) {
+                orderCreationDataSetter.populateCancelOrder(order, orderInfoResultSet, insuranceInfoResultSet,
+                        specimenInfoResultSet, minimumOrderSampleReceiveDateResultSet, panelInfoResultSet,
+                        singleTestInfoResultSet, aggregatePathologyResultSet);
+            } else if ("CIRA".equals(orderType)) {
+                orderCreationDataSetter.populateCIRAOrder(order, ciraOrderInfoResultSet, insuranceInfoResultSet,
+                        specimenInfoResultSet, minimumOrderSampleReceiveDateResultSet, panelInfoResultSet,
+                        singleTestInfoResultSet, aggregatePathologyResultSet);
+            }
+
+            return order;
+        } catch (SQLException e) {
+            logger.error("ERROR", e);
+            return null;
+        }
+
+    }
+}
+
+
+////////////////////////////
+//package com.omniseq.climsweb.messages.lis;
+
+import messages.lis.model.*;
+import util.MessageUtil;
+import org.apache.commons.configuration.ConfigurationException;
+import org.apache.commons.lang.StringUtils;
+import org.apache.log4j.Logger;
+
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class OrderCreationDataSetter {
+
+    Logger logger = Logger.getLogger(OrderGenerator.class);
+
+    private final String CLIMS_DATE_FORMAT = "yyyy-MM-dd HH:mm:ss";
+    private final String STAGE_PREFIX = "Stage";
+
+    private static final class Source {
+        private static final String CONNECT = "CONNECT";
+        private static final String C = "C";
+        private static final String SYAPSE = "SYAPSE";
+    }
+
+    public void populateNewOrder(Order order, ResultSet orderInformationResultSet,
+                                 ResultSet orderInsuranceInfoResultSet, ResultSet orderSpecimenInfoResultSet,
+                                 ResultSet minimumOrderSampleReceiveDateResultSet, ResultSet panelInfoResultSet,
+                                 ResultSet singleTestInfoResultSet, ResultSet aggregatePathologyResultSet)
+            throws SQLException, ConfigurationException {
+
+        while (orderInformationResultSet.next()) {
+            order.setExternalOrderId(orderInformationResultSet.getString("orderId"));
+            order.setAccessionedSamplesId(orderInformationResultSet.getString("accessionedSamplesId"));
+            order.setTherapyDetails(orderInformationResultSet.getString("therapyDetails"));
+            order.setAdditionalDiagnosis(orderInformationResultSet.getString("additionalDiagnosis"));
+            order.setSpecimenFacility(orderInformationResultSet.getString("specimenFacility"));
+            order.setSpecimenSource(orderInformationResultSet.getString("specimenSource"));
+
+            populateSource(order, orderInformationResultSet);
+            populateTumorStage(order, orderInformationResultSet);
+            populateOrderPlacedDate(order, orderInformationResultSet);
+            populateSpecimenCollectionDate(order, orderInformationResultSet);
+            populateSampleProcurementDate(order, orderInformationResultSet);
+            populateMinReceivedDate(order, minimumOrderSampleReceiveDateResultSet);
+            populateSubject(order, orderInformationResultSet);
+            populateRequestor(order, orderInformationResultSet);
+            populateOrganization(order, orderInformationResultSet);
+            populateOrderTypeConfiguration(order);
+            populateIcdCode(order, orderInformationResultSet);
+            decideToPopulateTestInfoOrPanelInfoForNewOrderOrCancelOrder(order, orderInformationResultSet, panelInfoResultSet, singleTestInfoResultSet, "newOrder");
+            populateBillingInformation(order, orderInformationResultSet);
+            populatePaymentInfo(order, orderInsuranceInfoResultSet);
+            populateOmniDisease(order, orderInformationResultSet);
+            populateAggregatePathology(order, aggregatePathologyResultSet);
+            populateSamples(order, orderSpecimenInfoResultSet);
+        }
+    }
+
+    public void populateCancelOrder(Order order, ResultSet orderInformationResultSet,
+                                    ResultSet orderInsuranceInfoResultSet, ResultSet orderSpecimenInfoResultSet,
+                                    ResultSet minimumOrderSampleReceiveDateResultSet, ResultSet panelInfoResultSet,
+                                    ResultSet singleTestInfoResultSet, ResultSet aggregatePathologyResultSet)
+            throws SQLException, ConfigurationException {
+
+        while (orderInformationResultSet.next()) {
+            order.setExternalOrderId(orderInformationResultSet.getString("orderId"));
+
+            String accessionedSampleId = orderInformationResultSet.getString("accessionedSamplesId");
+            if (accessionedSampleId != null) {
+                order.setAccessionedSamplesId(accessionedSampleId);
+            }
+
+            String therapyDetails = orderInformationResultSet.getString("therapyDetails");
+            if (therapyDetails != null) {
+                order.setTherapyDetails(therapyDetails);
+            }
+
+            String additionalDiagnosis = orderInformationResultSet.getString("additionalDiagnosis");
+            if (additionalDiagnosis != null) {
+                order.setAdditionalDiagnosis(additionalDiagnosis);
+            }
+
+            String specimenFacility = orderInformationResultSet.getString("specimenFacility");
+            if (specimenFacility != null) {
+                order.setSpecimenFacility(specimenFacility);
+            }
+
+            String specimenSource = orderInformationResultSet.getString("specimenSource");
+            if (specimenSource != null) {
+                order.setSpecimenSource(specimenSource);
+            }
+
+            populateSource(order, orderInformationResultSet);
+            populateTumorStage(order, orderInformationResultSet);
+            populateOrderPlacedDate(order, orderInformationResultSet);
+            populateSpecimenCollectionDate(order, orderInformationResultSet);
+            populateSampleProcurementDate(order, orderInformationResultSet);
+            populateMinReceivedDate(order, minimumOrderSampleReceiveDateResultSet);
+            populateSubject(order, orderInformationResultSet);
+            populateRequestor(order, orderInformationResultSet);
+            populateOrganization(order, orderInformationResultSet);
+            populateOrderTypeConfiguration(order);
+            populateOrderStatusHistoryForCancelledOrder(order);
+            populateIcdCode(order, orderInformationResultSet);
+            decideToPopulateTestInfoOrPanelInfoForNewOrderOrCancelOrder(order, orderInformationResultSet, panelInfoResultSet, singleTestInfoResultSet, "cancelOrder");
+            populateBillingInformation(order, orderInformationResultSet);
+            populatePaymentInfo(order, orderInsuranceInfoResultSet);
+            populateOmniDisease(order, orderInformationResultSet);
+            populateAggregatePathology(order, aggregatePathologyResultSet);
+            populateSamples(order, orderSpecimenInfoResultSet);
+        }
+    }
+
+    public void populateCIRAOrder(Order order, ResultSet ciraOrderInfoResultSet, ResultSet insuranceInfoResultSet,
+                                  ResultSet specimenInfoResultSet, ResultSet minimumOrderSampleReceiveDateResultSet,
+                                  ResultSet panelInfoResultSet, ResultSet singleTestInfoResultSet,
+                                  ResultSet aggregatePathologyResultSet) throws SQLException, ConfigurationException {
+        while (ciraOrderInfoResultSet.next()) {
+            order.setExternalOrderId(ciraOrderInfoResultSet.getString("orderId"));
+            order.setAccessionedSamplesId(ciraOrderInfoResultSet.getString("accessionedSamplesId"));
+            //order.setTherapyDetails(orderInfoResultSet.getString("therapyDetails"));
+            //order.setAdditionalDiagnosis(orderInfoResultSet.getString("additionalDiagnosis"));
+            //order.setSpecimenFacility(orderInfoResultSet.getString("specimenFacility"));
+            //order.setSpecimenSource(orderInfoResultSet.getString("specimenSource"));
+
+            populateSource(order, ciraOrderInfoResultSet);
+            //populateTumorStage(order, orderInfoResultSet);
+
+            //populateOrderPlacedDate(order, ciraOrderInfoResultSet);
+            populateSpecimenCollectionDate(order, ciraOrderInfoResultSet);
+            //populateSampleProcurementDate(order, ciraOrderInfoResultSet);
+            populateMinReceivedDate(order, minimumOrderSampleReceiveDateResultSet);
+
+            populateCIRASubject(order, ciraOrderInfoResultSet);
+            //populateRequestor(order, orderInfoResultSet);
+            populateOrganization(order, ciraOrderInfoResultSet);
+            populateCIRAOrderTypeConfiguration(order);
+            //populateIcdCode(order, orderInfoResultSet);
+            decideToPopulateTestInfoOrPanelInfoForNewOrderOrCancelOrder(order, ciraOrderInfoResultSet, panelInfoResultSet, singleTestInfoResultSet, "CIRA");
+            //populateBillingInformation(order, orderInfoResultSet);
+            //populatePaymentInfo(order, insuranceInfoResultSet);
+            //populateOmniDisease(order, orderInfoResultSet);
+            //populateAggregatePathology(order, aggregatePathologyResultSet);
+            populateSamples(order, specimenInfoResultSet);
+        }
+    }
+
+    private void populateSource(Order order, ResultSet resultSet) throws SQLException {
+        String orderSource = resultSet.getString("orderSource");
+        if (StringUtils.isEmpty(orderSource) || Source.CLIMS.equals(orderSource)) {
+            order.setSource(Source.CLIMS);
+        } else if (Source.CONNECT.equals(orderSource) || Source.SYAPSE.equals(orderSource)) {
+            order.setSource(orderSource);
+        }
+    }
+
+    private void populateTumorStage(Order order, ResultSet resultSet) throws SQLException {
+        String orderSource = order.getSource();
+        TumorStage tumorStage = new TumorStage();
+        String tumorStageFromResultSet = resultSet.getString("tumorStage");
+
+        if (Source.SYAPSE.equals(orderSource)) {
+            if ("Occult Carcinoma".equals(tumorStageFromResultSet)) {
+                tumorStage.setStage("Occult");
+            } else if ("Not Applicable".equals(tumorStageFromResultSet)) {
+                tumorStage.setStage("Not applicable");
+            } else if ("Unknown".equals(tumorStageFromResultSet)) {
+                tumorStage.setStage("Unknown");
+            } else {
+                if (StringUtils.containsIgnoreCase(tumorStageFromResultSet, STAGE_PREFIX)) {
+                    tumorStage.setStage(tumorStageFromResultSet);
+                } else {
+                    tumorStage.setStage(String.format("%s %s", STAGE_PREFIX, tumorStageFromResultSet));
+                }
+            }
+        } else if (Source.CONNECT.equals(orderSource) || Source.CLIMS.equals(orderSource)) {
+            tumorStage.setStage(tumorStageFromResultSet);
+        }
+
+        order.setTumorStage(tumorStage);
+    }
+
+    private void populateOrderPlacedDate(Order order, ResultSet resultSet) throws SQLException {
+        String initialOrderPlacedDate = resultSet.getString("orderPlacedDate");
+        String orderPlacedDate = MessageUtil.convertClimsDateToLISString(CLIMS_DATE_FORMAT, initialOrderPlacedDate);
+        order.setOrderPlacedDate(orderPlacedDate);
+    }
+
+    private void populateSpecimenCollectionDate(Order order, ResultSet resultSet) throws SQLException {
+        String initialSampleCollectionDateAsString = resultSet.getString("specimenCollectionDate");
+        if (initialSampleCollectionDateAsString != null) {
+            String sampleCollectionDate = MessageUtil.convertClimsDateToLISString(CLIMS_DATE_FORMAT, initialSampleCollectionDateAsString);
+            order.setSampleCollectionDate(sampleCollectionDate);
+        }
+    }
+
+    private void populateSampleProcurementDate(Order order, ResultSet resultSet) throws SQLException {
+        String initialSampleProcurementDateAsString = resultSet.getString("sampleProcurementDate");
+        if (initialSampleProcurementDateAsString != null) {
+            String sampleProcurementDate = MessageUtil.convertClimsDateToLISString(CLIMS_DATE_FORMAT, initialSampleProcurementDateAsString);
+            order.setSampleProcurementDate(sampleProcurementDate);
+        }
+    }
+
+    private void populateMinReceivedDate(Order order, ResultSet resultSet) throws SQLException {
+        while (resultSet.next()) {
+            String initialSampleReceivedDate = resultSet.getString("minReceivedDate");
+            if (initialSampleReceivedDate != null) {
+                String sampleReceivedDate = MessageUtil.convertClimsDateToLISString(CLIMS_DATE_FORMAT, initialSampleReceivedDate);
+                order.setSampleReceivedDate(sampleReceivedDate);
+            }
+        }
+    }
+
+    private void populateSubject(Order order, ResultSet resultSet) throws SQLException {
+        Subject subject = new Subject();
+
+        SubjectType subjectType = new SubjectType();
+        subjectType.setName("Patient");
+        subject.setType(subjectType);
+
+        Patient patient = new Patient();
+        patient.setFirstName(resultSet.getString("patientFirstName"));
+        patient.setMiddleInitial(resultSet.getString("patientMiddleInitial"));
+        patient.setLastName(resultSet.getString("patientLastName"));
+        patient.setMrn(resultSet.getString("patientMrn"));
+
+        String testPatientFlag = resultSet.getString("testPatientFlag");
+        boolean testOnly = "Y".equals(testPatientFlag);
+        patient.setTestOnly(testOnly);
+
+        String patientGender = getGenderFromGenderFlag(resultSet.getString("patientGender"));
+        patient.setGender(patientGender);
+
+        String initialPatientDateOfBirth = resultSet.getString("patientDateOfBirth");
+        String patientDateOfBirth = MessageUtil.convertClimsDateToLISString(CLIMS_DATE_FORMAT, initialPatientDateOfBirth);
+        patient.setDateOfBirth(patientDateOfBirth);
+
+        Address patientAddress = new Address();
+        patientAddress.setStreet(resultSet.getString("patientAddressStreet"));
+        patientAddress.setCity(resultSet.getString("patientAddressCity"));
+        patientAddress.setState(resultSet.getString("patientAddressState"));
+        patientAddress.setZipCode(resultSet.getString("patientAddressZip"));
+        patientAddress.setPrimaryPhoneNumber(resultSet.getString("patientHomePhone"));
+        patientAddress.setSecondaryPhoneNumber(resultSet.getString("patientWorkPhone"));
+        patientAddress.setFaxNumber(resultSet.getString("patientFax"));
+        patient.setAddress(patientAddress);
+
+        subject.setPatient(patient);
+
+        order.setSubject(subject);
+    }
+
+    private void populateCIRASubject(Order order, ResultSet resultSet) throws SQLException {
+        Subject subject = new Subject();
+
+        SubjectType subjectType = new SubjectType();
+        subjectType.setName("Trial Subject");
+        subject.setType(subjectType);
+
+        TrialSubject trialSubject = new TrialSubject();
+        trialSubject.setSubjectIdentifier(resultSet.getString("subjectname"));
+        trialSubject.setAge(Integer.parseInt(resultSet.getString("age")));
+        trialSubject.setStudyId(resultSet.getString("studyid"));
+        trialSubject.setSiteId(resultSet.getString("siteid"));
+        trialSubject.setGender(getGenderFromGenderFlag(resultSet.getString("gender")));
+
+        subject.setTrialSubject(trialSubject);
+        order.setSubject(subject);
+    }
+
+    private String getGenderFromGenderFlag(String genderFlag) {
+        switch(genderFlag) {
+            case "M":
+                return "Male";
+            case "F":
+                return "Female";
+            default:
+                return "Unspecified";
+        }
+    }
+
+    private void populateRequestor(Order order, ResultSet resultSet) throws SQLException {
+        Requestor requestor = new Requestor();
+
+        RequestorType requestorType = new RequestorType();
+        requestorType.setName("Physician");
+        requestor.setRequestorType(requestorType);
+
+        Physician physician = new Physician();
+        physician.setNpi(Long.parseLong(resultSet.getString("physicianNpiNumber")));
+        physician.setPracticeName(resultSet.getString("physicianOrganization"));
+        physician.setFirstName(resultSet.getString("physicianFirstName"));
+        physician.setLastName(resultSet.getString("physicianLastName"));
+
+        Address physicianAddress = new Address();
+        physicianAddress.setStreet(resultSet.getString("physicianAddressStreet"));
+        physicianAddress.setCity(resultSet.getString("physicianAddressCity"));
+        physicianAddress.setState(resultSet.getString("physicianAddressState"));
+        physicianAddress.setZipCode(resultSet.getString("physicianAddressZip"));
+        physicianAddress.setPrimaryPhoneNumber(resultSet.getString("physicianPhone"));
+        physicianAddress.setFaxNumber(resultSet.getString("physicianFax"));
+        physician.setAddress(physicianAddress);
+
+        requestor.setPhysician(physician);
+
+        order.setRequestor(requestor);
+    }
+    
+    private void populateOrganization(Order order, ResultSet resultSet) throws SQLException {
+        Organization organization = new Organization();
+        organization.setName(resultSet.getString("organizationName"));
+        order.setOrganization(organization);
+    }
+
+    private void populateOrderTypeConfiguration(Order order) {
+        OrderTypeConfiguration typeConfiguration = new OrderTypeConfiguration();
+        typeConfiguration.setName("Clinical");
+        typeConfiguration.setDescription("Order placed for a patient, by a physician");
+        order.setTypeConfiguration(typeConfiguration);
+    }
+
+    private void populateCIRAOrderTypeConfiguration(Order order) {
+        OrderTypeConfiguration typeConfiguration = new OrderTypeConfiguration();
+        typeConfiguration.setName("CIRA Trial");
+        order.setTypeConfiguration(typeConfiguration);
+    }
+
+    private void populateOrderStatusHistoryForCancelledOrder(Order order) {
+        OrderStatusHistory orderStatusHistory = new OrderStatusHistory();
+        OrderStatus orderStatus = new OrderStatus();
+        orderStatus.setName("Cancelled");
+        orderStatusHistory.setStatus(orderStatus);
+
+        List<OrderStatusHistory> statusHistories = new ArrayList<>();
+        statusHistories.add(orderStatusHistory);
+
+        order.setStatusHistories(statusHistories);
+    }
+
+    private void populateIcdCode(Order order, ResultSet resultSet) throws SQLException {
+        // set the first (primary) icd Code, we will always have a primary Icd Code
+        IcdCode icdCode = new IcdCode();
+        String code = resultSet.getString("icdCode");
+        if (StringUtils.isEmpty(code)) {
+            icdCode.setCode("UNLSTD");
+        } else {
+            icdCode.setCode(code);
+        }
+        order.setIcdCode(icdCode);
+
+        // set the secondary Icd Code, if we get one
+        String secondaryCode = resultSet.getString("secondaryIcdCode");
+        if (StringUtils.isNotEmpty(secondaryCode)) {
+            IcdCode secondaryIcdCode = new IcdCode();
+            secondaryIcdCode.setCode(secondaryCode);
+            order.setSecondaryIcdCode(secondaryIcdCode);
+        }
+    }
+
+
+    private void decideToPopulateTestInfoOrPanelInfoForNewOrderOrCancelOrder(Order order, ResultSet orderInformationResultSet, ResultSet panelInfoResultSet, ResultSet singleTestInfoResultSet, String orderType) throws SQLException, ConfigurationException {
+        if ("newOrder".equals(orderType)) {
+            populateTestInfoAndOrPanelInfo(order, orderInformationResultSet, panelInfoResultSet, singleTestInfoResultSet, false);
+        } else if ("cancelOrder".equals(orderType)) {
+            populateTestInfoAndOrPanelInfo(order, orderInformationResultSet, panelInfoResultSet, singleTestInfoResultSet, true);
+        } else if ("CIRA".equals(orderType)) {
+            populateCIRAPanelInfo(order, orderInformationResultSet, panelInfoResultSet, false);
+        }
+    }
+
+    private void populateTestInfoAndOrPanelInfo(Order order, ResultSet orderInformationResultSet, ResultSet panelInfoResultSet,
+                                                ResultSet singleTestInfoResultSet, boolean isCancelled)
+            throws SQLException, ConfigurationException {
+        if (panelInfoResultSet.isBeforeFirst()) {
+
+            while (panelInfoResultSet.next()) {
+                populatePanel(order, orderInformationResultSet, panelInfoResultSet, isCancelled);
+            }
+        }
+        if (singleTestInfoResultSet.isBeforeFirst()) {
+            while (singleTestInfoResultSet.next()) {
+                populateTest(order, orderInformationResultSet, singleTestInfoResultSet, isCancelled);
+            }
+        }
+    }
+
+    private void populatePanel(Order order, ResultSet orderInformationResultSet, ResultSet panelInfoResultSet,
+                               boolean isCancelled) throws SQLException, ConfigurationException {
+        List<Panel> panels = new ArrayList<>();
+
+        while (panelInfoResultSet.next()) {
+            Panel panel = new Panel();
+
+            PanelConfiguration panelConfiguration = new PanelConfiguration();
+            panelConfiguration.setName(panelInfoResultSet.getString("panelName"));
+            panel.setConfiguration(panelConfiguration);
+
+            if (Source.CONNECT.equals(order.getSource())) {
+                long connectPanelId = Long.parseLong(panelInfoResultSet.getString("connectPanelId"));
+                panel.setConnectId(connectPanelId);
+            }
+
+            PanelReport report = new PanelReport();
+
+            int reportType = isCancelled ? 5 : 0; // 5 = INITIAL_CANCELLATION, 0 = INITIAL
+            String cancellationReason = isCancelled ? getCancelReason(orderInformationResultSet.getString("orderId")) : null;
+            report.setType(reportType);
+            report.setReason(cancellationReason);
+
+            panel.addOcpReport(report);
+
+            panels.add(panel);
+        }
+
+        order.setPanels(panels);
+    }
+
+    private void populateCIRAPanelInfo(Order order, ResultSet orderInformationResultSet, ResultSet panelInfoResultSet,
+                                       boolean isCancelled)
+            throws SQLException {
+        List<Panel> panels = new ArrayList<>();
+        Panel panel = new Panel();
+        PanelConfiguration panelConfiguration = new PanelConfiguration();
+        panelConfiguration.setName("Custom Immune Response Assay");
+        panel.setConfiguration(panelConfiguration);
+
+        if (Source.CONNECT.equals(order.getSource())) {
+            long connectPanelId = Long.parseLong(panelInfoResultSet.getString("connectPanelId"));
+            panel.setConnectId(connectPanelId);
+        }
+
+        PanelReport report = new PanelReport();
+
+        if (isCancelled) {
+            String orderCancelReason;
+
+            // To test locally, use the hardcoded value below, locally Clims will blow up, if you get the
+            // orderCancelReason by using the lisOrderHelper, this is because the helper, uses the messageUtil which
+            // needs to get a connectionId, this connectionId can only be gotten in our TEST environment.
+            // This is a known LabVantage/Clims bug
+            orderCancelReason = getCancelReason(orderInformationResultSet.getString("orderId"));
+            //orderCancelReason = "Other";
+
+            report.setType(5);  // 5 = INITIAL_CANCELLATION
+            report.setReason(orderCancelReason);
+
+        } else {
+            report.setType(0); // 0 = INITIAL
+        }
+        panel.addCiraReport(report);
+
+        panels.add(panel);
+        order.setPanels(panels);
+    }
+
+
+    private String getCancelReason(String orderId) throws SQLException {
+        String orderCancelReason;
+        orderCancelReason = OrderHelper.getOrderCancelReasonFromMessageUtil(orderId);
+        return orderCancelReason;
+    }
+
+    private void populateTest(Order order, ResultSet orderInformationResultSet, ResultSet singleTestInfoResultSet,
+                              boolean isCancelled) throws SQLException, ConfigurationException {
+        List<Test> tests = new ArrayList<>();
+
+        while (singleTestInfoResultSet.next()) {
+            Test test = new Test();
+
+            TestConfiguration testConfiguration = new TestConfiguration();
+            testConfiguration.setName(singleTestInfoResultSet.getString("singleTestName"));
+            test.setConfiguration(testConfiguration);
+
+            if (Source.CONNECT.equals(order.getSource())) {
+                long connectTestId = Long.parseLong(singleTestInfoResultSet.getString("connectTestId"));
+                test.setConnectId(connectTestId);
+            }
+
+            Report report = new Report();
+            int reportType = isCancelled ? 5 : 0; // 5 = INITIAL_CANCELLATION, 0 = INITIAL
+            String cancellationReason = isCancelled ? getCancelReason(orderInformationResultSet.getString("orderId")) : null;
+            report.setType(reportType);
+            report.setReason(cancellationReason);
+
+            test.addReport(report);
+
+            tests.add(test);
+        }
+
+        order.setTests(tests);
+    }
+
+    private void populateBillingInformation(Order order, ResultSet resultSet) throws SQLException {
+        String billType = determineBillType(resultSet.getString("billTo"));
+        order.setBillingInformation(new BillingInformation(billType));
+    }
+
+    private String determineBillType(String billTo) {
+        if (billTo == null || billTo.isEmpty() || billTo.equalsIgnoreCase("Alternate") || billTo.equalsIgnoreCase("Alternate payment")) {
+            return "Contract";
+        } else if (billTo.equalsIgnoreCase("Self-pay")) {
+            return "Self-Pay";
+        } else if (billTo.equalsIgnoreCase("Insurance")) {
+            return "Insurance";
+        } else {
+            return billTo;
+        }
+    }
+
+    private void populatePaymentInfo(Order order, ResultSet orderInsuranceInfoResultSet) throws SQLException {
+        List<Insurance> insurances = new ArrayList<>();
+        String billToFromOrder = order.getBillingInformation().getName();
+        if ("Insurance".equals(billToFromOrder)) {
+            while (orderInsuranceInfoResultSet.next()) {
+                insurances.add(createInsuranceFromResultSet(orderInsuranceInfoResultSet));
+            }
+        } else if ("Self-Pay".equals(billToFromOrder)) {
+            insurances.add(createSelfPayInsurance(order));
+        }
+        order.setInsurances(insurances);
+    }
+
+    private Insurance createInsuranceFromResultSet(ResultSet resultSet) throws SQLException {
+        Insurance insurance = new Insurance();
+        insurance.setName(resultSet.getString("insuranceName"));
+        insurance.setCoverageType("Primary");
+        insurance.setPolicyNumber(resultSet.getString("policyNumber"));
+        insurance.setGroupNumber(resultSet.getString("groupNumber"));
+        insurance.setInsuredName(resultSet.getString("insuredName"));
+        String initialInsuredDateOfBirth = resultSet.getString("insuredDateOfBirth");
+        String insuredDateOfBirth = MessageUtil.convertClimsDateToLISString(CLIMS_DATE_FORMAT, initialInsuredDateOfBirth);
+        insurance.setInsuredDateOfBirth(insuredDateOfBirth);
+        insurance.setInsuredRelationshipToPatient(resultSet.getString("insuredRelationshipToPatient"));
+        return insurance;
+    }
+
+    private Insurance createSelfPayInsurance(Order order) {
+        Insurance insurance = new Insurance();
+        insurance.setName("Self-Pay");
+        insurance.setCoverageType("Primary");
+        insurance.setPolicyNumber("Self-Pay");
+        insurance.setGroupNumber("Self-Pay");
+        insurance.setInsuredName(order.getSubject().getPatient().getFirstName() + " " + order.getSubject().getPatient().getLastName());
+        insurance.setInsuredDateOfBirth(order.getSubject().getPatient().getDateOfBirth());
+        insurance.setInsuredRelationshipToPatient("Self");
+        return insurance;
+    }
+
+    private void populateOmniDisease(Order order, ResultSet resultSet) throws SQLException {
+        OmniDisease omniDisease = new OmniDisease();
+        omniDisease.setClimsOmniDiseaseId(resultSet.getString("omnibasediseaseid"));
+        order.setOmniDisease(omniDisease);
+    }
+
+    private void populateSamples(Order order, ResultSet resultSet) throws SQLException {
+        List<Sample> samples = new ArrayList<>();
+        while (resultSet.next()) {
+            samples.add(createSampleFromResultSet(resultSet));
+        }
+        order.setSamples(samples);
+    }
+
+    private Sample createSampleFromResultSet(ResultSet resultSet) throws SQLException {
+        Sample sample = new Sample();
+
+        String accessionedId = resultSet.getString("specimenLabel");
+        if (accessionedId != null) {
+            sample.setAccessionedId(accessionedId);
+        }
+
+        String initialSampleReceivedDate = resultSet.getString("receiveDate");
+        if (initialSampleReceivedDate != null) {
+            String sampleReceivedDate = MessageUtil.convertClimsDateToLISString(CLIMS_DATE_FORMAT, initialSampleReceivedDate);
+            sample.setReceivedDate(sampleReceivedDate);
+        }
+
+        String initialSampleCollectedDate = resultSet.getString("collectionDate");
+        if (initialSampleCollectedDate != null) {
+            String sampleCollectedDate = MessageUtil.convertClimsDateToLISString(CLIMS_DATE_FORMAT, initialSampleCollectedDate);
+            sample.setCollectedDate(sampleCollectedDate);
+        }
+
+        String quantityAsString = resultSet.getString("quantity");
+        if (quantityAsString != null) {
+            sample.setQuantity(quantityAsString);
+        }
+
+        String units = resultSet.getString("units");
+        if (units != null) {
+            sample.setUnit(units);
+        }
+
+        String purpose = resultSet.getString("purpose");
+        if (purpose != null) {
+            sample.setPurpose(purpose);
+        }
+
+        SampleType sampleType = new SampleType();
+        String sampleTypeName = resultSet.getString("sampleType");
+        if (sampleTypeName != null) {
+            sampleType.setName(sampleTypeName);
+        }
+        sample.setSampleType(sampleType);
+
+        String externalId = resultSet.getString("externalId");
+        if (externalId != null) {
+            sample.setExternalId(externalId);
+        }
+
+        String tumorNormal = resultSet.getString("tumorNormal");
+        if (tumorNormal != null) {
+            sample.setTumorNormal(tumorNormal);
+        }
+
+        String isFromCustomer = resultSet.getString("isFromCustomer");
+        sample.setIsFromCustomer("Y".equalsIgnoreCase(isFromCustomer));
+
+        String lessThanTwoNg = resultSet.getString("lessThanTwoNg");
+        sample.setLessThanTwoNg("Y".equalsIgnoreCase(lessThanTwoNg));
+
+        String libraryQCFail = resultSet.getString("libraryQCFail");
+        sample.setLibraryQCFail("Y".equalsIgnoreCase(libraryQCFail));
+
+        return sample;
+    }
+
+    private void populateAggregatePathology(Order order, ResultSet resultSet) throws SQLException {
+        Map<String, AggregatePathology> pathologyMap = createSampleToPathologyMapForResultSet(resultSet);
+        AggregatePathology aggregatePathology = createAggregatePathologyFromPathologyMap(pathologyMap);
+        order.setAggregatePathology(aggregatePathology);
+    }
+
+    private Map<String, AggregatePathology> createSampleToPathologyMapForResultSet(ResultSet resultSet) throws SQLException {
+        Map<String, AggregatePathology> pathologyMap = new HashMap<>();
+        while (resultSet.next()) {
+            String sampleId = resultSet.getString("keyid1");
+            if (!pathologyMap.containsKey(sampleId)) {
+                pathologyMap.put(sampleId, new AggregatePathology());
+            }
+
+            AggregatePathology samplesPathology = pathologyMap.get(sampleId);
+            samplesPathology.setAccessionedPathologyId(resultSet.getString("u_pathologyreportid"));
+            String fieldName = resultSet.getString("paramid");
+            String value = resultSet.getString("enteredtext");
+
+            if ("PMR".equals(fieldName)) {
+                samplesPathology.setCancerType(value);
+            } else if ("% Necrosis".equals(fieldName)) {
+                samplesPathology.setNecrosis(Integer.parseInt(value));
+            } else if ("% Tumor Nuclei".equals(fieldName)) {
+                samplesPathology.setNeoplasticNuclei(Integer.parseInt(value));
+            } else if ("Cellularity".equals(fieldName)) {
+                samplesPathology.setCellularity(Integer.parseInt(value));
+            } else if ("T-Code".equals(fieldName)) {
+                TissueSite tissueSite = new TissueSite();
+                tissueSite.setCode(value);
+                samplesPathology.setTissueSite(tissueSite);
+            } else if ("M-Code".equals(fieldName)) {
+                Histology histology = new Histology();
+                histology.setCode(value);
+                samplesPathology.setHistology(histology);
+            }
+        }
+        return pathologyMap;
+    }
+
+    private AggregatePathology createAggregatePathologyFromPathologyMap(Map<String, AggregatePathology> pathologyMap) {
+        if (pathologyMap.isEmpty()) {
+            return null;
+        }
+
+        int sampleCount = pathologyMap.keySet().size();
+        float cumulativeNecrosis = 0.0f;
+        float cumulativeNeoplasticNuclei = 0.0f;
+        float cumulativeCellularity = 0.0f;
+
+        AggregatePathology aggregatePathology = new AggregatePathology();
+        for (AggregatePathology pathology : pathologyMap.values()) {
+            aggregatePathology.setAccessionedPathologyId(pathology.getAccessionedPathologyId());
+            aggregatePathology.setCancerType(pathology.getCancerType());
+            cumulativeNecrosis += pathology.getNecrosis();
+            cumulativeNeoplasticNuclei += pathology.getNeoplasticNuclei();
+            cumulativeCellularity += pathology.getCellularity();
+
+            TissueSite tissueSite = new TissueSite();
+            tissueSite.setCode(pathology.getTissueSite().getCode());
+            aggregatePathology.setTissueSite(tissueSite);
+
+            Histology histology = new Histology();
+            histology.setCode(pathology.getHistology().getCode());
+            aggregatePathology.setHistology(histology);
+        }
+
+        aggregatePathology.setNecrosis(Math.round(cumulativeNecrosis / sampleCount));
+        aggregatePathology.setNeoplasticNuclei(Math.round(cumulativeNeoplasticNuclei / sampleCount));
+        aggregatePathology.setCellularity(Math.round(cumulativeCellularity / sampleCount));
+
+        return aggregatePathology;
+    }
+
+}
+
+
+
+/////////////////////////////////////
+//CToDataWarehouseClient
+
+package client;
+
+import service.DataWarehouseService;
+import service.DataWarehouseTokenService;
+import util.ClimsProperties;
+import util.ConfigProperties;
+import org.apache.commons.configuration.ConfigurationException;
+import org.apache.log4j.Logger;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.io.IOException;
+import java.net.MalformedURLException;
+import java.security.SignatureException;
+
+public class CToDataWarehouseClient {
+
+    private Logger logger = org.apache.log4j.Logger.getLogger(CToDataWarehouseClient.class);
+
+    private String DATA_WAREHOUSE_URL;
+    private String DATA_WAREHOUSE_USERNAME;
+    private String DATA_WAREHOUSE_PASSWORD;
+    private DataWarehouseService dwService;
+    DataWarehouseTokenService dwTokenService;
+
+    private static final class Endpoint {
+        private static final String CREATE_ORDER_PATH = "/orders/c";
+        private static final String SEND_RUN_MESSAGE_PATH = "/run/c";
+        private static final String SEND_OCP_CONFIRMATION_PATH = "/confirmations/c/receive";
+        private static final String SEND_CANCEL_MESSAGE_PATH = ""; //TODO: get this path/endpoint
+    }
+
+    public CToDataWarehouseClient() throws ConfigurationException {
+        CProperties cProperties = new ConfigProperties().getConfigProperties();
+        DATA_WAREHOUSE_URL = climsProperties.data_warehouse_url;
+        DATA_WAREHOUSE_USERNAME = cProperties.data_warehouse_username;
+        DATA_WAREHOUSE_PASSWORD = cProperties.data_warehouse_password;
+        dwService = new DataWarehouseService();
+        dwTokenService = new DataWarehouseTokenService();
+
+    }
+
+    public String getDataWarehouseSessionToken() {
+        String sessionUrl = DATA_WAREHOUSE_URL + "/sessions";
+        try {
+            String sessionAuthorizationToken = dwTokenService.generateSessionToken(DATA_WAREHOUSE_USERNAME, DATA_WAREHOUSE_PASSWORD);
+            String response = dwService.createSessionRequest(sessionUrl, sessionAuthorizationToken);
+            JSONObject responseAsJson = new JSONObject(response);
+
+            return responseAsJson.getString("token");
+        } catch (MalformedURLException malformedURLException) {
+            logger.error("Exception Occurred While Attempting to Create URL  " + sessionUrl + " -  No Protocol Found", malformedURLException);
+        } catch (IOException ioException) {
+            logger.error("Exception Occurred When Attempting to Connect to URL " + sessionUrl, ioException);
+        } catch (JSONException jsonException) {
+            logger.error("Exception Occurred While Converting Response To Json", jsonException);
+        }
+
+        return null;
+    }
+
+    public String createOrder(String sessionToken, String orderPayload) {
+        String createOrderUrl = DATA_WAREHOUSE_URL + Endpoint.CREATE_ORDER_PATH;
+        return getResponse("POST", sessionToken, orderPayload, Endpoint.CREATE_ORDER_PATH, createOrderUrl);
+    }
+
+    private String getResponse(String httpMethod, String sessionToken, String data, String path, String urlToHit) {
+        try {
+            String authorizationToken = dwTokenService.generateRequestToken(httpMethod, path, data, sessionToken);
+            String response = dwService.makeRequest(authorizationToken, urlToHit, data, httpMethod);
+            return response;
+        } catch (MalformedURLException malformedURLException) {
+            logger.error("Exception Occurred While Attempting to Create URL  " + urlToHit + " -  No Protocol Found", malformedURLException);
+            return "";
+        } catch (IOException ioException) {
+            logger.error("Exception Occurred When Attempting to Connect to URL " + urlToHit, ioException);
+            return "";
+        } catch (SignatureException signatureException) {
+            logger.error("Exception Occurred While Trying to Generate Signature for Data Warehouse Authorization Token" + urlToHit, signatureException);
+            return "";
+        }
+    }
+
+    public String sendRunMessage(String sessionToken, String payload) {
+        String sendRunMessageUrl = DATA_WAREHOUSE_URL + Endpoint.SEND_RUN_MESSAGE_PATH;
+        return getResponse("POST", sessionToken, payload, Endpoint.SEND_RUN_MESSAGE_PATH, sendRunMessageUrl);
+    }
+
+    public String sendConfirmationResult(String sessionToken, String payload) {
+        String sendConfirmationUrl = DATA_WAREHOUSE_URL + Endpoint.SEND_OCP_CONFIRMATION_PATH;
+        return getResponse("POST", sessionToken, payload, Endpoint.SEND_OCP_CONFIRMATION_PATH, sendConfirmationUrl);
+    }
+
+    public String sendCancelMessage(String sessionToken, String payload) {
+        String sendConfirmationUrl = DATA_WAREHOUSE_URL + Endpoint.SEND_CANCEL_MESSAGE_PATH;
+        return getResponse("POST", sessionToken, payload, Endpoint.SEND_CANCEL_MESSAGE_PATH, sendConfirmationUrl);
+    }
+}
+
+/////////////////
+//Order.java
+
+package systemTwo.model;
+
+import java.util.List;
+
+public class Order {
+    private String externalOrderId;
+    private String accessionedSamplesId;
+    private String diagnosis;
+    private TumorStage tumorStage;
+    private String orderPlacedDate; //must be in the format of yyyy-MM-dd hh:mm:ss
+    private String sampleProcurementDate; //must be in the format of yyyy-MM-dd hh:mm:ss
+    private String sampleCollectionDate; //must be in the format of yyyy-MM-dd hh:mm:ss
+    private String sampleReceivedDate; //must be in the format of yyyy-MM-dd hh:mm:ss
+    private Subject subject;
+    private Requestor requestor;
+    private Organization organization;
+    private OrderTypeConfiguration typeConfiguration;
+    private List<OrderStatusHistory> statusHistories;
+    private IcdCode icdCode;
+    private IcdCode secondaryIcdCode;
+    private List<Test> tests;
+    private List<Sample> samples;
+    private List<Insurance> insurances;
+    private BillingInformation billingInformation;
+    private String therapyDetails;
+    private String additionalDiagnosis;
+    private List<Panel> panels;
+    private String specimenFacility;
+    private String specimenSource;
+    private String source;
+    private OmniDisease omniDisease;
+    private AggregatePathology aggregatePathology;
+
+    public String getExternalOrderId() {
+        return externalOrderId;
+    }
+
+    public void setExternalOrderId(String externalOrderId) {
+        this.externalOrderId = externalOrderId;
+    }
+
+    public TumorStage getTumorStage() {
+        return tumorStage;
+    }
+
+    public void setTumorStage(TumorStage tumorStage) {
+        this.tumorStage = tumorStage;
+    }
+
+    public String getAccessionedSamplesId() {
+        return accessionedSamplesId;
+    }
+
+    public void setAccessionedSamplesId(String accessionedSamplesId) {
+        this.accessionedSamplesId = accessionedSamplesId;
+    }
+
+    public String getDiagnosis() {
+        return diagnosis;
+    }
+
+    public void setDiagnosis(String diagnosis) {
+        this.diagnosis = diagnosis;
+    }
+
+    public String getOrderPlacedDate() {
+        return orderPlacedDate;
+    }
+
+    public void setOrderPlacedDate(String orderPlacedDate) {
+        this.orderPlacedDate = orderPlacedDate;
+    }
+
+    public String getSampleProcurementDate() {
+        return sampleProcurementDate;
+    }
+
+    public void setSampleProcurementDate(String sampleProcurementDate) {
+        this.sampleProcurementDate = sampleProcurementDate;
+    }
+
+    public String getSampleCollectionDate() {
+        return sampleCollectionDate;
+    }
+
+    public void setSampleCollectionDate(String sampleCollectionDate) {
+        this.sampleCollectionDate = sampleCollectionDate;
+    }
+
+    public String getSampleReceivedDate() {
+        return sampleReceivedDate;
+    }
+
+    public void setSampleReceivedDate(String sampleReceivedDate) {
+        this.sampleReceivedDate = sampleReceivedDate;
+    }
+
+    public Subject getSubject() {
+        return subject;
+    }
+
+    public void setSubject(Subject subject) {
+        this.subject = subject;
+    }
+
+    public Requestor getRequestor() {
+        return requestor;
+    }
+
+    public void setRequestor(Requestor requestor) {
+        this.requestor = requestor;
+    }
+
+    public Organization getOrganization() {
+        return organization;
+    }
+
+    public void setOrganization(Organization organization) {
+        this.organization = organization;
+    }
+
+    public OrderTypeConfiguration getTypeConfiguration() {
+        return typeConfiguration;
+    }
+
+    public void setTypeConfiguration(OrderTypeConfiguration typeConfiguration) {
+        this.typeConfiguration = typeConfiguration;
+    }
+
+    public List<OrderStatusHistory> getStatusHistories() {
+        return statusHistories;
+    }
+
+    public void setStatusHistories(List<OrderStatusHistory> statusHistories) {
+        this.statusHistories = statusHistories;
+    }
+
+    public IcdCode getIcdCode() {
+        return icdCode;
+    }
+
+    public void setIcdCode(IcdCode icdCode) {
+        this.icdCode = icdCode;
+    }
+
+    public IcdCode getSecondaryIcdCode() {
+        return secondaryIcdCode;
+    }
+
+    public void setSecondaryIcdCode(IcdCode secondaryIcdCode) {
+        this.secondaryIcdCode = secondaryIcdCode;
+    }
+
+    public List<Test> getTests() {
+        return tests;
+    }
+
+    public void setTests(List<Test> tests) {
+        this.tests = tests;
+    }
+
+    public List<Sample> getSamples() {
+        return samples;
+    }
+
+    public void setSamples(List<Sample> samples) {
+        this.samples = samples;
+    }
+
+    public List<Insurance> getInsurances() {
+        return insurances;
+    }
+
+    public void setInsurances(List<Insurance> insurances) {
+        this.insurances = insurances;
+    }
+
+    public BillingInformation getBillingInformation() {
+        return billingInformation;
+    }
+
+    public void setBillingInformation(BillingInformation billingInformation) {
+        this.billingInformation = billingInformation;
+    }
+
+    public String getTherapyDetails() {
+        return therapyDetails;
+    }
+
+    public void setTherapyDetails(String therapyDetails) {
+        this.therapyDetails = therapyDetails;
+    }
+
+    public String getAdditionalDiagnosis() {
+        return additionalDiagnosis;
+    }
+
+    public void setAdditionalDiagnosis(String additionalDiagnosis) {
+        this.additionalDiagnosis = additionalDiagnosis;
+    }
+
+    public List<Panel> getPanels() {
+        return panels;
+    }
+
+    public void setPanels(List<Panel> panels) {
+        this.panels = panels;
+    }
+
+    public String getSpecimenFacility() {
+        return specimenFacility;
+    }
+
+    public void setSpecimenFacility(String specimenFacility) {
+        this.specimenFacility = specimenFacility;
+    }
+
+    public String getSpecimenSource() {
+        return specimenSource;
+    }
+
+    public void setSpecimenSource(String specimenSource) {
+        this.specimenSource = specimenSource;
+    }
+
+    public String getSource() {
+        return source;
+    }
+
+    public void setSource(String source) {
+        this.source = source;
+    }
+
+    public OmniDisease getOmniDisease() {
+        return omniDisease;
+    }
+
+    public void setOmniDisease(OmniDisease omniDisease) {
+        this.omniDisease = omniDisease;
+    }
+
+    public AggregatePathology getAggregatePathology() {
+        return aggregatePathology;
+    }
+
+    public void setAggregatePathology(AggregatePathology aggregatePathology) {
+        this.aggregatePathology = aggregatePathology;
+    }
+}
+
+
+
+

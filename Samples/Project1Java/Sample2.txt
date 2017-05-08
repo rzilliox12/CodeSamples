@@ -1,0 +1,236 @@
+//Sample2
+
+///////////////////////////////////////
+//class CreateUpdateOrderMessage.java
+
+package actionModels;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class CreateUpdateOrderMessage {
+    private String type;
+    private List<String> orderIds;
+
+    public String getType() {
+        return type;
+    }
+
+    public void setType(String type) {
+        this.type = type;
+    }
+
+    public List<String> getOrderIds() {
+        return orderIds;
+    }
+
+    public void setOrderIds(List<String> orderIds) {
+        this.orderIds = orderIds;
+    }
+
+    public CreateUpdateOrderMessage() {
+    }
+
+    public CreateUpdateOrderMessage(String type) {
+        this.type = type;
+        this.orderIds = new ArrayList<>();
+    }
+
+    public void addOrderId(String orderId) {
+        this.orderIds.add(orderId);
+    }
+}
+
+/////////////////////////////////
+//class SendOrderIdsToCWS
+
+package actions;
+
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import actionModels.CreateUpdateOrderMessage;
+import util.CProperties;
+import util.CUtil;
+import util.LUtil;
+import org.apache.commons.lang3.StringUtils;
+import sapphire.action.BaseAction;
+import sapphire.util.Logger;
+
+import java.net.URL;
+import java.util.HashMap;
+import java.util.List;
+
+public class SendOrderIdsToCWS extends BaseAction {
+
+    /**
+     * CLIMS configuration properties.
+     */
+    private CProperties configurationProperties = CUtil.getProperties();
+
+    /**
+     * When invoked, connects to the CLIMS web services sending over the required order ids needed to handle and
+     * process order creation.
+     *
+     * @return Integer representing a web service success or failure.  The integer 1 corresponds to success, 2 to
+     * failure.
+     */
+    @Override
+    public int processAction(String actionId, String actionVersionId, HashMap hashMap) {
+        String type = (String) hashMap.get("createUpdateOrderType");
+
+        String orderIds = (String) hashMap.get("orderids");
+        List<String> uniqueOrderIds = LUtil.extractUniqueValues(orderIds);
+        uniqueOrderIds.remove("Control"); // Remove any controls from the list.
+        Logger.logInfo("Processing request to send orders [" + StringUtils.join(uniqueOrderIds.toArray(), ", ") + "] to the web services for order creation.");
+
+        if (configurationProperties == null) {
+            return FAILURE;
+        }
+
+        CreateUpdateOrderMessage createUpdateOrderMessage = new CreateUpdateOrderMessage(type);
+        for (String orderId : uniqueOrderIds) {
+            createUpdateOrderMessage.addOrderId(orderId);
+        }
+
+        Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+        String createUpdateOrderMessageAsJson = gson.toJson(createUpdateOrderMessage);
+
+        return postOrderIds(createUpdateOrderMessageAsJson, uniqueOrderIds);
+    }
+
+    /**
+     * Initiates a POST request to the Clims Web Services to initiate the process of creating an order in the data
+     * warehouse.
+     *
+     * @param createUpdateOrderMessageAsJson json containing Id(s) corresponding to an order which is to be
+     *                                       created in the DataWarehouse, also contains a createUpdateOrderType, which
+     *                                       will tell the WS how to create the correct order object.
+     * @param uniqueOrderIds                 list of orderIds that are in the JSON message string, only used to log
+     * @return Integer representing the overall success or failure of the order creation process.  The integer 1
+     * corresponds to success, 2 to failure.
+     */
+    private int postOrderIds(String createUpdateOrderMessageAsJson, List<String> uniqueOrderIds) {
+        try {
+            String orderCreationAddress = configurationProperties.web_datawarehouse_sendcreateupdateordermessage;
+
+            URL orderCreationURL = new URL(orderCreationAddress);
+            CallWebService webService = new CallWebService();
+
+            Logger.logInfo("Sending an order creation request for order [" + uniqueOrderIds + "] to web service address [" + orderCreationAddress + "].");
+
+            boolean callResult = webService.postJsonToWeb(orderCreationURL, createUpdateOrderMessageAsJson, "Sending OrderIds To CWS", configurationProperties.connectionManagerUsername, configurationProperties.connectionManagerPassword);
+            return callResult ? SUCCESS : FAILURE;
+        } catch (Exception e) {
+            Logger.logError("Exception occurred while sending an order creation request to the web services for order [" + uniqueOrderIds + "]", e);
+            return FAILURE;
+        }
+    }
+}
+
+///////////////////////////////
+//class CallWebService.java
+
+
+public boolean postJsonToWeb(URL postUrl, String jsonString, String messageType, String connectionManagerUsername,
+                                String connectionManagerPassword) {
+        Logger.logInfo("Sending request (Json Message) to Web Services.");
+        MessageUtil messageUtil = new MessageUtil();
+
+        try {
+            SystemsWeb systemsWeb = new SystemsWeb(logger);
+            String wsResponse = systemsWeb.sendJsonMessage(postUrl, jsonString);
+            Logger.logInfo("Web service request returned response: " + wsResponse);
+
+            if (wsResponse.contains("POSTFAILURE")) {
+                Logger.logInfo("Failed to send JSON message to Web Services.");
+                String logMessageId = messageUtil.logMessage("System One", "Web Services", MessageUtil.getTimeStamp(),
+                        messageType, "Failure", jsonString, "N/A", "Error", "Error", connectionManagerUsername,
+                        connectionManagerPassword);
+                logWSLoggingStatus(logMessageId, messageType);
+                return false;
+            } else {
+                Logger.logInfo("Successfully sent JSON message to Web Services.");
+                String logMessageId = messageUtil.logMessage("System One", "Web Services", MessageUtil.getTimeStamp(),
+                        messageType, "Success", jsonString, "N/A", "Ok", "Ok", connectionManagerUsername,
+                        connectionManagerPassword);
+                return logWSLoggingStatus(logMessageId, messageType);
+            }
+        } catch (Exception e) {
+            setError("ERROR: Failed to send JSON message to Web Services", e);
+            String logMessageId = messageUtil.logMessage("System One", "Web Services", MessageUtil.getTimeStamp(),
+                    messageType, "Failure", jsonString, "N/A", "Error", "Error", connectionManagerUsername,
+                    connectionManagerPassword);
+            logWSLoggingStatus(logMessageId, messageType);
+            return false;
+        }
+    }
+	
+	
+////////////////
+//SystemsWeb.java
+
+/**
+     * sendJsonMessage is used to send a message (POST) using a JSON string
+     */
+    public String sendJsonMessage(URL postUrl, String jsonMessage) throws IOException {
+        sapphire.util.Logger.logInfo("Posting Json Message to initiate message from ClimsWeb");
+        sapphire.util.Logger.logInfo("POST URL: " + postUrl);
+
+        HttpURLConnection httpURLConnection = (HttpURLConnection) postUrl.openConnection();
+        httpURLConnection.setRequestMethod("POST");
+        httpURLConnection.setRequestProperty("Content-Type", "application/json");
+        httpURLConnection.setRequestProperty("charset", "utf-8");
+        httpURLConnection.setDoInput(true);
+        httpURLConnection.setDoOutput(true);
+        httpURLConnection.setInstanceFollowRedirects(false);
+
+        addJsonMessageToRequest(jsonMessage, httpURLConnection);
+
+        return getRequestResponse(httpURLConnection);
+    }
+
+    private void addJsonMessageToRequest(String jsonMessage, HttpURLConnection httpURLConnection) throws IOException {
+        OutputStream outputStream = httpURLConnection.getOutputStream();
+
+        try (OutputStreamWriter outputStreamWriter = new OutputStreamWriter(outputStream, "UTF-8")) {
+            outputStreamWriter.write(jsonMessage);
+        }
+    }
+
+    private String getRequestResponse(HttpURLConnection httpURLConnection) {
+        try (
+                InputStream inputStream = getInputStreamByResponseCode(Integer.toString(httpURLConnection.getResponseCode()), httpURLConnection);
+                InputStreamReader inputStreamReader = new InputStreamReader(inputStream);
+                BufferedReader bufferedReader = new BufferedReader(inputStreamReader)
+        ) {
+
+            return createResponseMessage(bufferedReader);
+        } catch (IOException ex) {
+            sapphire.util.Logger.logError("IOException When Trying to Read Response", ex);
+            return "FAILURE";
+        } finally {
+            try {
+                httpURLConnection.disconnect();
+            } catch (Exception e) {
+                /* Intentionally Swallow Exception */
+            }
+        }
+    }
+
+    private InputStream getInputStreamByResponseCode(String responseCode, HttpURLConnection httpURLConnection) throws IOException {
+        if (responseCode.startsWith("20")) {
+            return httpURLConnection.getInputStream();
+        } else {
+            return httpURLConnection.getErrorStream();
+        }
+    }
+
+    private String createResponseMessage(BufferedReader bufferedReader) throws IOException {
+        String currentLine = bufferedReader.readLine();
+        String message = currentLine;
+        while (null != (currentLine = bufferedReader.readLine())) {
+            message = message + "\n" + currentLine;
+        }
+        return message;
+    }

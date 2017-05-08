@@ -1,0 +1,163 @@
+//Sample3
+
+///////////////////////
+//SendCPAEmail.java
+
+actions;
+
+import util.OpalUtil;
+import org.apache.commons.lang.StringUtils;
+import sapphire.accessor.ActionException;
+import sapphire.action.BaseAction;
+import sapphire.util.DataSet;
+import sapphire.util.Logger;
+import sapphire.xml.PropertyList;
+
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+
+public class SendCPAEmail extends BaseAction {
+
+    @Override
+    public int processAction(String actionid, String actionversionid, HashMap properties) {
+        try {
+            String sampleIds = properties.get("sampleids").toString();
+            DataSet results = getCompletedPreAnalyticSamples(sampleIds);
+            List<PreAnalyticSampleProperties> sampleProperties = extractSamplePropertiesFromDataSet(results);
+            sendEmail(sampleProperties);
+            return SUCCESS;
+        } catch(ActionException e) {
+            Logger.logError("Error sending email notification for completion of pre-analytics workflow: " + e.getMessage());
+            setError("Error sending email notification for completion of pre-analytics workflow.");
+            return FAILURE;
+        }
+    }
+
+    private DataSet getCompletedPreAnalyticSamples(String sampleIds) {
+        StringBuilder sql = new StringBuilder();
+        sql.append("SELECT s.basedonsampleid AS sampleId, s.sampletypeid AS sampleType, ");
+        sql.append("(SELECT v.enteredtext ");
+        sql.append("FROM v_rpci_max_dataset v ");
+        sql.append("WHERE v.keyid1 = s.basedonsampleid ");
+        sql.append("AND v.paramid = 'Final Yield' ");
+        sql.append("AND (v.paramlistid = 'Quantitate RNA Qubit' OR v.paramlistid = 'Quantitate DNA Qubit')) as yield, ");
+        sql.append("(SELECT v.enteredtext ");
+        sql.append("FROM v_rpci_max_dataset v ");
+        sql.append("WHERE v.keyid1 = s.basedonsampleid ");
+        sql.append("AND v.paramid = 'Detected' ");
+        sql.append("AND (v.paramlistid = 'Quantitate RNA Qubit' OR v.paramlistid = 'Quantitate DNA Qubit')) as detected ");
+        sql.append("FROM s_sample s ");
+        sql.append("WHERE s.s_sampleid IN (").append(OpalUtil.getSqlWhereClause(sampleIds)).append(")");
+
+        return getQueryProcessor().getSqlDataSet(sql.toString());
+    }
+
+    private List<PreAnalyticSampleProperties> extractSamplePropertiesFromDataSet(DataSet dataSet) {
+        List<PreAnalyticSampleProperties> preAnalyticSamplePropertiesList = new ArrayList();
+        for(int i=0; i<dataSet.getRowCount(); i++) {
+            preAnalyticSamplePropertiesList.add(new PreAnalyticSampleProperties((HashMap)dataSet.get(i)));
+        }
+        return preAnalyticSamplePropertiesList;
+    }
+
+    private void sendEmail(List<PreAnalyticSampleProperties> samples) throws ActionException {
+        String recipients = getEmailRecipients();
+        String message = createEmailMessage(samples);
+
+        if(StringUtils.isNotEmpty(recipients)) {
+            PropertyList emailProperties = new PropertyList();
+            emailProperties.setProperty("subject", "Pre-Analytic Workflow is Complete");
+            emailProperties.setProperty("to", recipients);
+            emailProperties.setProperty("from", "no-reply@company.com");
+            emailProperties.setProperty("message", message);
+            emailProperties.setProperty("mailformat", "html");
+            getActionProcessor().processAction("SendMail", "1", emailProperties);
+        }
+    }
+
+    private String getEmailRecipients() {
+        List<String> emailRecipients = new ArrayList<>();
+        DataSet results = retrieveEmailRecipients();
+        for(int i=0; i<results.getRowCount(); i++) {
+            String recipient = results.getString(i, "email");
+            emailRecipients.add(recipient);
+        }
+        return StringUtils.join(emailRecipients, ";");
+    }
+
+    private DataSet retrieveEmailRecipients() {
+        StringBuilder sql = new StringBuilder();
+        sql.append("SELECT DISTINCT su.email AS email ");
+        sql.append("FROM sysuser su ");
+        sql.append("INNER JOIN sysuserrole sur ON su.sysuserid = sur.sysuserid ");
+        sql.append("WHERE sur.roleid IN ('PAP Lab Tech') ");
+        sql.append("AND su.email IS NOT NULL");
+
+        return getQueryProcessor().getSqlDataSet(sql.toString());
+    }
+
+    private String createEmailMessage(List<PreAnalyticSampleProperties> samples) {
+        Date todaysDate = new Date();
+        DateFormat dateFormat = new SimpleDateFormat("MMM dd yyyy");
+        String today = dateFormat.format(todaysDate);
+
+        StringBuilder message = new StringBuilder();
+        message.append("Hello, <br/><br/>The Pre-Analytic Workflow was completed on ").append(today).append(" for the following ").append(samples.size()).append(" sample(s): <br/><br/>\n");
+        message.append("<table border='1'>\n");
+        message.append("<tr>\n");
+        message.append("<th>Sample ID</th>\n");
+        message.append("<th>Sample Type</th>\n");
+        message.append("<th>Yield (ng)</th>\n");
+        message.append("</tr>\n");
+
+        for(PreAnalyticSampleProperties sample : samples) {
+            String finalYield = "Y".equalsIgnoreCase(sample.getDetected()) ? sample.getYield() : "Not Detected";
+            message.append("<tr>\n");
+            message.append("<td>").append(sample.getSampleId()).append("</td>\n");
+            message.append("<td>").append(sample.getSampleType()).append("</td>\n");
+            message.append("<td>").append(finalYield).append("</td>\n");
+            message.append("</tr>\n");
+        }
+
+        message.append("</table>\n");
+        message.append("<br/>");
+        message.append("- This is an automatic system generated message. -");
+        
+        return message.toString();
+    }
+
+    private class PreAnalyticSampleProperties {
+        private String sampleId;
+        private String sampleType;
+        private String detected;
+        private String yield;
+
+        public String getSampleId() {
+            return sampleId;
+        }
+
+        public String getSampleType() {
+            return sampleType;
+        }
+
+        public String getDetected() {
+            return detected;
+        }
+
+        public String getYield() {
+            return yield;
+        }
+
+        public PreAnalyticSampleProperties(HashMap rowData) {
+            sampleId = (String) rowData.get("sampleid");
+            sampleType = (String) rowData.get("sampletype");
+            detected = (String) rowData.get("detected");
+            yield = (String) rowData.get("yield");
+        }
+    }
+
+}

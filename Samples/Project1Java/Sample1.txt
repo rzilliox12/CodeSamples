@@ -1,0 +1,199 @@
+//Sample1
+
+/////////////////////////////////////////////////////
+//SendOrdersToWS.java
+
+package actions;
+
+import util.CProperties;
+import util.CUtil;
+import util.LUtil;
+import org.apache.commons.lang3.StringUtils;
+import sapphire.action.BaseAction;
+import sapphire.util.DataSet;
+import sapphire.util.Logger;
+
+import java.net.URL;
+import java.net.URLEncoder;
+import java.util.HashMap;
+import java.util.List;
+
+/** Handles sending a list of order ids to the web services for order creation and processing. */
+public class SendOrdersToWS extends BaseAction {
+
+    /** configuration properties. */
+    private CProperties configurationProperties = CUtil.getCProperties();
+
+    /**
+     * When invoked, connects to the web services sending over the required order ids needed to handle and
+     * process order creation.
+     *
+     * @return Integer representing a web service success or failure.  The integer 1 corresponds to success, 2 to
+     * failure.
+     */
+    @Override
+    public int processAction(String actionId, String actionVersionId, HashMap hashMap) {
+        String orderIds = (String) hashMap.get("orderids");
+        List<String> uniqueOrderIds = LUtil.extractUniqueValues(orderIds);
+        uniqueOrderIds.remove("Control"); // Remove any controls from the list.
+        Logger.logInfo("Processing request to send orders [" + StringUtils.join(uniqueOrderIds.toArray(), ", ") + "] to the web services for order creation.");
+        return sendOrdersToOtherSystem(uniqueOrderIds);
+    }
+
+    /**
+     * Loops over the passed in order ids and sends out web service requests to the appropriate endpoint to initiate
+     * the order creation process.  If a single call fails at any point, the overall call will be marked as a failure
+     * so that attention may be brought to the issue.
+     *
+     * @param orderIds List of unique order ids which correspond to orders which need to be created.
+     * @return Integer representing the overall success or failure of the order creation process.  The integer 1
+     * corresponds to success, 2 to failure.
+     */
+    private int sendOrdersToOtherSystem(List<String> orderIds) {
+        if(configurationProperties == null) {
+            return FAILURE;
+        }
+
+        int overallCallResult = SUCCESS;
+        for(String orderId: orderIds) {
+
+            String panelName = retrievePanelNameFromOrder(orderId);
+            if(StringUtils.isEmpty(panelName)){
+                overallCallResult = FAILURE;
+                Logger.logError("Order [" + orderId + "] did NOT have a panel associated with it.");
+                continue;
+            }
+
+            int callResult = postOrder(orderId, panelName);
+
+            if(callResult == FAILURE) {
+                overallCallResult = FAILURE;
+            }
+        }
+
+        return overallCallResult;
+    }
+
+    private String retrievePanelNameFromOrder(String orderId) {
+        String retrievedValue = "";
+
+        String sql = "SELECT \n"
+                + "pc.name AS panelname\n"
+                + "FROM u_panel p\n"
+                + "INNER JOIN u_panelconfiguration pc ON p.panelconfigid = pc.u_panelconfigurationid\n"
+                + "WHERE p.requestid = '" + orderId + "'";
+
+        DataSet dataSet = getQueryProcessor().getSqlDataSet(sql);
+
+        for (int i = 0; i < dataSet.getRowCount(); i++) {
+            retrievedValue = dataSet.getString(i, "panelname");
+        }
+
+        return StringUtils.isEmpty(retrievedValue) ? "" : retrievedValue;
+    }
+
+    /**
+     * Initiates a POST request to the web services to initiate the process of creating a single order in the data
+     * warehouse.
+     *
+     * @param orderId Id corresponding to an order in our system which is to be created in the other system.
+     * @param panelName the name of the panel or test associated with the orderId
+     * @return Integer representing the overall success or failure of the order creation process.  The integer 1
+     * corresponds to success, 2 to failure.
+     */
+    private int postOrder(String orderId, String panelName) {
+        try {
+            String orderCreationAddress = configurationProperties.web_datawarehouse_sendorder + "order_id=" + orderId + "&panel_name=" + URLEncoder.encode(panelName, "UTF-8");
+            URL orderCreationURL = new URL(orderCreationAddress);
+            CallWebService webService = new CallWebService();
+
+            Logger.logInfo("Sending an order creation request for order [" + orderId + "] to web service address [" + orderCreationAddress + "].");
+            boolean callResult = webService.postSystemsWeb(orderCreationURL, "order_id=" + orderId, "Send Order To Data Warehouse For LIS From CLIMS", configurationProperties.connectionManagerUsername, configurationProperties.connectionManagerPassword);
+            return callResult ? SUCCESS : FAILURE;
+        }
+        catch(Exception e) {
+            Logger.logError("Exception occurred while sending an order creation request to the web services for order [" + orderId + "]", e);
+            return FAILURE;
+        }
+    }
+
+}
+
+/////////////////////////
+//CallWebService.java
+
+public boolean postSystemsWeb(URL postUrl, String urlParameter, String messageType, String connectionManagerUsername,
+                                String connectionManagerPassword) {
+        Logger.logInfo("Sending request to Web Services.");
+        MessageUtil messageUtil = new MessageUtil();
+
+        try {
+            SystemsWeb systemsWeb = new SystemsWeb(logger);
+            String wsResponse = systemsWeb.sendMessage(postUrl);
+            Logger.logInfo("Web service request returned response: " + wsResponse);
+
+            if (wsResponse.contains("POSTFAILURE")) {
+                Logger.logInfo("Failed to send message to Web Services.");
+                String logMessageId = messageUtil.logMessage("System One", "Web Services", MessageUtil.getTimeStamp(),
+                        messageType, "Failure", urlParameter, "N/A", "Error", "Error", connectionManagerUsername,
+                        connectionManagerPassword);
+                logWSLoggingStatus(logMessageId, messageType);
+                return false;
+            } else {
+                Logger.logInfo("Successfully sent message to Web Services.");
+                String logMessageId = messageUtil.logMessage("System One", "Web Services", MessageUtil.getTimeStamp(),
+                        messageType, "Success", urlParameter, "N/A", "Ok", "Ok", connectionManagerUsername,
+                        connectionManagerPassword);
+                return logWSLoggingStatus(logMessageId, messageType);
+            }
+        } catch (Exception e) {
+            setError("ERROR: Failed to send", e);
+            String logMessageId = messageUtil.logMessage("System One", "Web Services", MessageUtil.getTimeStamp(),
+                    messageType, "Failure", urlParameter, "N/A", "Error", "Error", connectionManagerUsername,
+                    connectionManagerPassword);
+            logWSLoggingStatus(logMessageId, messageType);
+            return false;
+        }
+    }
+	
+	
+//////////////////
+//SystemsWeb.java
+
+/**
+     * sendMessage is used to send a message (POST) using url parameters
+     */
+    public String sendMessage(URL postUrl) throws IOException {
+        sapphire.util.Logger.logInfo("Posting to initiate message");
+        sapphire.util.Logger.logInfo("POST URL: " + postUrl);
+
+        HttpURLConnection httpURLConnection = (HttpURLConnection) postUrl.openConnection();
+        httpURLConnection.setRequestMethod("POST");
+        httpURLConnection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+        httpURLConnection.setRequestProperty("charset", "utf-8");
+        httpURLConnection.setDoInput(true);
+        httpURLConnection.setInstanceFollowRedirects(false);
+
+        try (InputStream inputStream = httpURLConnection.getInputStream();
+             InputStreamReader inputStreamReader = new InputStreamReader(inputStream);
+             BufferedReader bufferedReader = new BufferedReader(inputStreamReader)) {
+
+            String responseString = "";
+            String responseLine;
+            while (null != ((responseLine = bufferedReader.readLine()))) {
+                sapphire.util.Logger.logInfo("SUCCESS:POST success- " + responseLine);
+                responseString = responseString.concat(responseLine);
+            }
+            return responseString;
+        } catch (Exception e) {
+            LOGGER.error("Error posting.", e);
+            sapphire.util.Logger.logInfo("Error posting:" + e);
+            return "POSTFAILURE";
+        } finally {
+            try {
+                httpURLConnection.disconnect();
+            } catch (Exception e) { /* Intentionally Swallow Exception */
+            }
+        }
+    }
+	

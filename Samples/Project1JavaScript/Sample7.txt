@@ -1,0 +1,110 @@
+//Sample7
+
+///////////////////
+//advancedtoolbar_sampleentry.js
+
+/* 
+ * PURPOSE: Custom scripting for the sample entry maint page
+ */
+
+function addAnotherSample() {
+	// add a row to the maint grid
+	addGridRows("maint", 1);
+
+	// get values to default the request, createby(submitted by)
+	// reserved flag and auto receive flag
+	var requestid = document.getElementById("pr0_requestid").value;
+	var createby = document.getElementById("pr0_createby").value;
+	var reservedflag = document.getElementById("pr0_u_reservedflag").value;
+	var autoreceiveflag = document.getElementById("pr0_autoreceiveflag").value;
+
+	var maintTable = document.getElementById("maint_table");
+	if (maintTable) {
+		var rows = maintTable.getElementsByTagName('tbody')[0].rows;
+		var lastRowId = rows[rows.length - 1].id;
+		// lastRowId format is __pr#_row
+		var idPart = lastRowId.substring(lastRowId.indexOf("pr") + 2,
+				lastRowId.length);
+		var rowIndex = idPart.substring(0, idPart.indexOf("_"));
+
+		// ** note: first row is the header **
+		// default the request and the createby (submitted by) to the current
+		// user
+		// default reserved flag to No and AutoReceieve flag to Yes (this will
+		// set the status to Received)
+		if (requestid.indexOf(";") == -1) {
+			document.getElementById("pr" + (rowIndex) + "_requestid").value = requestid;
+			document.getElementById("pr" + (rowIndex) + "_createby").value = createby;
+			document.getElementById("pr" + (rowIndex) + "_u_reservedflag").value = reservedflag;
+			document.getElementById("pr" + (rowIndex) + "_autoreceiveflag").value = autoreceiveflag;
+		}
+	}
+}
+
+function deleteSelectedRows() {
+
+	var maintTable = document.getElementById("maint_table");
+	if (maintTable != null) {
+
+		var rows = maintTable.tBodies[0].rows;
+		var sampleSaved = false;
+		var sampleid, itemchecked;
+		var atLeastOneChecked = false;
+
+		for (var i = 1; i < rows.length; i++) {
+			sampleid = rows[i].cells[1].getElementsByTagName("input")[0].value;
+			itemchecked = rows[i].cells[0].getElementsByTagName("input")[0].checked;
+
+			if (itemchecked) {
+				atLeastOneChecked = true;
+				var ids = sapphire.page.maint.getSelectedKeyId1();
+
+				if (sampleid != null && ids != null && ids != "") {
+					// this is an actual saved request item record...
+					sampleSaved = true;
+					break;
+				}
+			}
+		}
+
+		if (!atLeastOneChecked) {
+			sapphire.ui.dialog
+					.alert("Please select at least one Sample to delete");
+		} else if (sampleSaved) {
+			sapphire.ui.dialog
+					.alert("A selected Sample has already been saved so it must be Disposed/Depleted in the Biobank");
+		} else {
+			deleteGridRows("maint");
+		}
+	}
+}
+
+function openStoragePage() {
+	// check to make sure user Saves before trying to Store Sample
+	if (top.getChangesMade()) {
+		sapphire.ui.dialog
+				.alert('Please save your changes before storing Samples');
+
+		return false;
+	}
+
+	// get all sample Ids
+	var ids = sapphire.page.maint.getSelectedKeyId1();
+
+	// check if sample are selected to be stored
+	if (ids == "" || ids == null) {
+		// warn user
+		sapphire.ui.dialog.alert("No Samples Selected");
+
+		return false;
+	} else {
+		// make sample ids semicolon delimited
+		var idlist = ids.replace('%3B', ';');
+		// store the sample
+		var url = "rc?command=page&page=clmStoreSample&sourcesdcid=Sample&sourcekeyid1="
+				+ idlist;
+		sapphire.lookup.util.openWindow('View', 'Sapphire', url, 950, 600,
+				false, {}, true);
+	}
+}
+

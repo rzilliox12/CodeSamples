@@ -1,0 +1,397 @@
+//Sample4
+
+////////////////
+//ParseDataFile
+
+package actions;
+
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+
+import util.*;
+
+import org.apache.commons.collections.MultiMap;
+import sapphire.accessor.ActionException;
+import sapphire.action.BaseAction;
+import sapphire.util.ActionBlock;
+import sapphire.util.DataSet;
+import sapphire.xml.PropertyList;
+
+/**
+ * Takes an input file and current step, and passes the file along to the
+ * appropriate parser.
+ *
+ */
+public class ParseDataFile extends BaseAction {
+    /**
+     * Makes sure that data importing is allowed for the current step and that
+     * the file is in the correct format before parsing the file
+     *
+     * @param actionid
+     * @param actionversionid
+     * @param properties
+     * @return SUCCESS or FAILURE
+     */
+    @Override
+    public int processAction(String actionid, String actionversionid, HashMap properties) {
+        String currentStep = properties.get("currentstep").toString();
+        String fileName = properties.get("uploadfile").toString();
+        String fileExtension = RoswellUtil.getFileExtension(fileName).toLowerCase();
+        String batchId = properties.get("batchid").toString();
+
+        List<String> keyId1s = RUtil.stringToList(properties.get("keyid1").toString());
+        List<String> dataSetInstances = RUtil.stringToList(properties.get("datasetinstances").toString());
+
+        MultiMap stepFileExtensionsMap = CParserUtil.getStepFileExtensions();
+        Collection stepFileExtensionCollection = (Collection) stepFileExtensionsMap.get(currentStep);
+
+        if (!stepFileExtensionsMap.containsKey(currentStep)) {
+            setError("Error", "Import data not allowed for this step");
+            return FAILURE;
+        }
+        if (!stepFileExtensionCollection.contains(fileExtension)) {
+            String errorMessage = "Invalid file type: expected '" +
+                    stepFileExtensionsMap.get(currentStep) + "', found '" + fileExtension + "'";
+            setError("Error", errorMessage);
+            return FAILURE;
+        }
+
+        parseFile(currentStep, fileName, keyId1s, dataSetInstances, fileExtension);
+        associateFile(batchId, fileName, keyId1s);
+
+        return SUCCESS;
+    }
+
+    /**
+     * Creates an instance of the appropriate parser based on the current step,
+     * parses the file, and processes the parser's actions.
+     *
+     * @param currentStep
+     * @param fileName
+     * @param keyId1s
+     */
+    private void parseFile(String currentStep, String fileName, List<String> keyId1s, List<String> dataSetInstances, String fileExtension) {
+        try {
+            ActionBlock actionBlock = new ActionBlock();
+
+            if (currentStep.equals("SS-DVT-01")) {
+                BioanalyzerParser bioanalyzerParser = new BioanalyzerParser(fileName, keyId1s, dataSetInstances, "DVTMaterialData", "Bioanalyzer QC(pmol)");
+                bioanalyzerParser.parseFile();
+                actionBlock = bioanalyzerParser.getActionBlock();
+
+            } else if ("SS-DLN-03".equals(currentStep) || "SS-DLN-04".equals(currentStep)) {
+                TapeStationParser tapeStationParser = new TapeStationParser(fileName, keyId1s, dataSetInstances);
+                tapeStationParser.parseFile();
+                actionBlock = tapeStationParser.getActionBlock();
+            } else if ("SS-DLN-05".equals(currentStep)) {
+                if ("csv".equals(fileExtension)) {
+                    TapeStationParser tapeStationParser = new TapeStationParser(fileName, keyId1s, dataSetInstances);
+                    tapeStationParser.parseFile();
+                    actionBlock = tapeStationParser.getActionBlock();
+                } else if ("xls".equals(fileExtension)) {
+                    QuantStudioParser quantStudioParser = new QuantStudioParser(fileName, keyId1s, dataSetInstances);
+                    quantStudioParser.parseFile();
+                    actionBlock = quantStudioParser.getActionBlock();
+                }
+            }
+
+            if (actionBlock.getActionCount() > 0) {
+                getActionProcessor().processActionBlock(actionBlock);
+            }
+        } catch (Exception e) {
+            setError("Error", "Invalid file format " + e.getMessage());
+        }
+    }
+
+    /**
+     * Associates the attachment with each of the samples
+     *
+     * @param batchId
+     * @param fileName
+     * @param keyId1s
+     */
+    private void associateFile(String batchId, String fileName, List<String> keyId1s) {
+        try {
+            ActionBlock actionBlock = new ActionBlock();
+            String keyId1;
+
+            for (int i = 0; i < keyId1s.size(); i++) {
+                keyId1 = keyId1s.get(i);
+                deletePreviousAttachment(keyId1, batchId, i, actionBlock);
+                PropertyList sdiAttachmentProperties = getAddAttachmentProperties(keyId1s.get(i),
+                        fileName, batchId);
+
+                actionBlock.setAction("AddSDIAttachment_" + i, "AddSDIAttachment", "1", sdiAttachmentProperties);
+            }
+
+            if (actionBlock.getActionCount() > 0) {
+                getActionProcessor().processActionBlock(actionBlock);
+            }
+        } catch (Exception e) {
+            setError("There was a problem saving the file");
+        }
+    }
+
+    /**
+     * Deletes any previous attachments associated with this sample for this step
+     *
+     * @param keyId1
+     * @param batchId
+     * @param index
+     * @param actionBlock
+     * @throws ActionException
+     */
+    private void deletePreviousAttachment(String keyId1, String batchId, int index, ActionBlock actionBlock)
+            throws ActionException {
+        String attachmentNumber = getAttachmentNumber(keyId1, batchId);
+
+        if (!attachmentNumber.isEmpty()) {
+            PropertyList deleteProperties = getDeleteAttachmentProperties(keyId1, attachmentNumber);
+            actionBlock.setAction("DeleteSDIAttachment_" + index, "DeleteSDIAttachment", "1", deleteProperties);
+        }
+    }
+
+    /**
+     * Returns the unique attachmentNumber for the specified sampleId and step
+     *
+     * @param keyId1
+     * @param batchId
+     * @return
+     */
+    private String getAttachmentNumber(String keyId1, String batchId) {
+        String attachmentNumber = "";
+
+        String sql = "SELECT attachmentnum " +
+                "FROM sdiattachment " +
+                "WHERE sdcid = 'Sample' " +
+                "AND keyid1 = ? " +
+                "AND attachmentdesc = ?";
+
+        PreparedStatement selectStatement = null;
+        ResultSet resultSet = null;
+        try {
+            selectStatement = database.prepareStatement(sql);
+            selectStatement.setString(1, keyId1);
+            selectStatement.setString(2, batchId);
+
+            resultSet = selectStatement.executeQuery();
+            if (resultSet != null) {
+                DataSet results = new DataSet(resultSet);
+                if (results.getRowCount() > 0) {
+                    attachmentNumber = results.getBigDecimal(0, "attachmentnum").toString();
+                }
+            }
+        } catch (Exception ex) {
+            setError("Error", "Error retrieving storage samples: " + ex.getMessage());
+        } finally {
+            JDBCUtil.close(selectStatement);
+            JDBCUtil.close(resultSet);
+        }
+
+        return attachmentNumber;
+    }
+
+    /**
+     * Creates a PropertyList for the delete attachment action
+     *
+     * @param keyId1
+     * @param attachmentNumber
+     * @return
+     */
+    private PropertyList getDeleteAttachmentProperties(String keyId1, String attachmentNumber) {
+        PropertyList deleteProperties = new PropertyList();
+        deleteProperties.setProperty("sdcid", "Sample");
+        deleteProperties.setProperty("keyid1", keyId1);
+        deleteProperties.setProperty("attachmentnum", attachmentNumber);
+
+        return deleteProperties;
+    }
+
+    /**
+     * Creates a PropertyList for the add attachment action
+     *
+     * @param keyId1
+     * @param fileName
+     * @param description
+     * @return
+     */
+    private PropertyList getAddAttachmentProperties(String keyId1, String fileName, String description) {
+        PropertyList sdiAttachmentProperties = new PropertyList();
+        sdiAttachmentProperties.setProperty("sdcid", "Sample");
+        sdiAttachmentProperties.setProperty("keyid1", keyId1);
+        sdiAttachmentProperties.setProperty("filename", fileName);
+        sdiAttachmentProperties.setProperty("description", description);
+        sdiAttachmentProperties.setProperty("type", "R");
+
+        return sdiAttachmentProperties;
+    }
+}
+
+
+///////////////////////
+//CParserUtil.java
+
+public class CParserUtil {
+    /**
+     * Creates a mapping between the steps and the expected file extensions
+     *
+     * @return HashMap of the steps and file extensions
+     */
+    public static MultiMap getStepFileExtensions() {
+        MultiMap stepFileExtensions = new MultiHashMap();
+        stepFileExtensions.put("SS-DVT-01", "xml");
+        stepFileExtensions.put("SS-DLN-03", "csv");
+        stepFileExtensions.put("SS-DLN-04", "csv");
+        stepFileExtensions.put("Retrospective", "csv");
+        stepFileExtensions.put("SS-DLN-05", "csv");
+        stepFileExtensions.put("SS-DLN-05", "xls");
+        return stepFileExtensions;
+    }
+}
+
+////////////////////////////
+//TapeStationParser.java
+
+package util;
+
+import sapphire.accessor.ActionException;
+import sapphire.util.ActionBlock;
+import sapphire.xml.PropertyList;
+
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class TapeStationParser {
+    private String fileName;
+    private List<String> sampleIds;
+    private ActionBlock actionBlock;
+    private List<String> dataSetInstances;
+
+    public TapeStationParser(String fileName, List<String> sampleIds, List<String> dataSetInstances) {
+        this.fileName = fileName;
+        this.sampleIds = sampleIds;
+        this.dataSetInstances = dataSetInstances;
+        this.actionBlock = new ActionBlock();
+    }
+
+    final int sampleIdsFromFileColumn = 2;
+    final int tapeStationValuesFromFileColumn = 7;
+    final String csvSplitBy = ",";
+
+    /**
+     * Retrieves the ActionBlock
+     *
+     * @return ActionBlock
+     */
+    public ActionBlock getActionBlock() {
+        return actionBlock;
+    }
+
+    /**
+     * Parses the TapeStation csv by iterating over the "Row" elements
+     *
+     * @throws Exception
+     */
+    public void parseFile() throws Exception {
+        String rowInFile;
+        Map<String, String> tapeStationValuePairsFromFile = new HashMap();
+
+        try (BufferedReader bufferedReader = new BufferedReader(new FileReader(fileName))) {
+            while ((rowInFile = bufferedReader.readLine()) != null) {
+                String[] line = rowInFile.split(csvSplitBy);
+                tapeStationValuePairsFromFile.put(line[sampleIdsFromFileColumn], line[tapeStationValuesFromFileColumn]);
+            }
+        } catch (IOException e) {
+
+        }
+
+        Map<String, String> tapeStationValuePairs = createMapWithValidatedPairs(tapeStationValuePairsFromFile);
+
+        for (Map.Entry<String, String> tapeStationValuePairsEntry : tapeStationValuePairs.entrySet()) {
+            String sampleId = tapeStationValuePairsEntry.getKey();
+            String tapeStationValue = tapeStationValuePairsEntry.getValue();
+            updateParamList(sampleId, tapeStationValue);
+        }
+    }
+
+    /**
+     * Checks the parsed values from the csv file against the samples from CLIMS
+     * creates a new map containing pairs that match with samples in CLIMS
+     *
+     * @param tapeStationValuePairsFromFile
+     * @return tapeStationValuePairsMatchedToSamplesFromClims
+     */
+    private Map<String, String> createMapWithValidatedPairs(Map<String, String> tapeStationValuePairsFromFile) {
+        Map<String, String> tapeStationValuePairsMatchedToSamplesFromClims = new HashMap<>();
+        for (String sampleId : sampleIds) {
+            String tapeStationValue = tapeStationValuePairsFromFile.get(sampleId);
+            if (tapeStationValue != null) {
+                tapeStationValuePairsMatchedToSamplesFromClims.put(sampleId, tapeStationValue);
+            }
+        }
+        return tapeStationValuePairsMatchedToSamplesFromClims;
+    }
+
+    /**
+     * Using the new map, which should contain samples that match those in CLIMS, with their tapeStation values
+     * update the parameter list
+     *
+     * @param sampleId
+     * @param tapeStationValue
+     * @throws ActionException
+     */
+    private void updateParamList(String sampleId, String tapeStationValue) throws ActionException {
+        String dataSetInstance = getDataSetInstance(sampleId);
+        PropertyList dataItemProperties = getDataItemProperties(sampleId, tapeStationValue, dataSetInstance);
+        actionBlock.setAction("EnterDataItem_" + sampleId, "EnterDataItem", "1", dataItemProperties);
+    }
+
+    /**
+     * Retrieves the dataset instance ID for the corresponding sample ID
+     *
+     * @param sampleId
+     * @return dataSetInstance
+     */
+    private String getDataSetInstance(String sampleId) {
+        String dataSetInstance = "1";
+
+        for (int i = 0; i < sampleIds.size(); i++) {
+            if (sampleIds.get(i).equals(sampleId)) {
+                dataSetInstance = dataSetInstances.get(i);
+                break;
+            }
+        }
+        return dataSetInstance;
+    }
+
+    /**
+     * Creates a PropertyList needed to create a data item
+     *
+     * @param sampleId
+     * @param tapeStationValue
+     * @param dataSetInstance
+     * @return dataItemProperties
+     */
+    private PropertyList getDataItemProperties(String sampleId, String tapeStationValue, String dataSetInstance) {
+        PropertyList dataItemProperties = new PropertyList();
+        dataItemProperties.setProperty("sdcid", "Sample");
+        dataItemProperties.setProperty("keyid1", sampleId);
+        dataItemProperties.setProperty("paramlistid", "TapeStation QC");
+        dataItemProperties.setProperty("paramlistversionid", "1");
+        dataItemProperties.setProperty("variantid", "TapeStation QC");
+        dataItemProperties.setProperty("dataset", dataSetInstance);
+        dataItemProperties.setProperty("paramtype", "Standard");
+        dataItemProperties.setProperty("replicateid", "1");
+        dataItemProperties.setProperty("paramid", "TapeStation QC");
+        dataItemProperties.setProperty("enteredtext", tapeStationValue);
+
+        return dataItemProperties;
+    }
+}
